@@ -1,203 +1,243 @@
-# AI-Native Organization System
+# AI-Native Organization OS
 
-An **AI-first organizational system** that redesigns hiring, project execution, meetings, and employee state management by assigning **ownership** to AI and **judgment** to humans.
+An AI-first system that automates corporate coordination, not people.
 
-This project demonstrates how a company would operate **if AI existed first**, instead of adding AI on top of legacy workflows.
-
----
-
-## Table of Contents
-
-- [Problem](#problem)
-- [Solution](#solution)
-- [System Overview](#system-overview)
-- [Core Design Principles](#core-design-principles)
-- [Human vs AI Responsibilities](#human-vs-ai-responsibilities)
-- [End-to-End Demo Flow](#end-to-end-demo-flow)
-- [Key Components](#key-components)
-- [Architecture (High Level)](#architecture-high-level)
-- [Limitations](#limitations)
-- [Future Improvements](#future-improvements)
-- [Disclaimer](#disclaimer)
+AI-Native Organization OS rethinks how modern organizations operate by embedding AI directly into project teams as a context-owning member.  
+Instead of meetings, status reports, and manual coordination, AI maintains system truth while humans focus on judgment and execution.
 
 ---
 
-## Problem
+## 🚩 Problem
 
-Modern organizations rely on:
-- Resume-based hiring
-- Manual status updates
-- Meetings for alignment
-- Human memory for decisions
-- Lagging dashboards for leadership
+Modern organizations suffer from:
 
-These systems:
-- Miss talented candidates
-- Create information delays
-- Increase coordination overhead
-- Cause repeated discussions and misalignment
-- Prevent leadership from acting early
+- Too many meetings for status alignment
+- Fragmented tools (Jira, Slack, docs, tickets)
+- Lost context between teams
+- Slow leadership decision-making
+- Manual triage of tasks, bugs, and priorities
 
-AI is often added as a **helper**, not as a **responsible system**.
+Most AI tools today are bolted on top of these broken processes.
 
 ---
 
-## Solution
+## 💡 Solution
 
-This project **rebuilds organizational workflows from scratch** by:
+**Rebuild corporate coordination from scratch using AI.**
 
-- Making **AI the owner of organizational state**
-- Treating every employee action as an **event**
-- Embedding an **AI member in each project team**
-- Giving leadership **real-time system intelligence**
-- Keeping humans responsible for **judgment, ethics, and final decisions**
+This system introduces:
 
-Instead of helping humans manage complexity, **AI absorbs complexity**.
-
----
-
-## System Overview
-
-The system is composed of interconnected AI roles:
-
-- **Hiring AI**
-  - Evaluates applicants based on real work
-  - Sorts candidates according to project needs
-- **Project AI (AI Teammate)**
-  - Tracks tasks, dependencies, and risks
-  - Maintains project memory and state
-- **Meeting AI**
-  - Listens to meetings
-  - Detects decisions, priorities, and owners
-- **Employee State AI**
-  - Processes employee updates as events
-  - Maintains skills, availability, and workload
-- **Leadership View**
-  - Aggregates signals across projects
-  - Enables prioritization, pausing, or dismissal of projects
-
-All components operate on a **shared system truth**.
+- An AI member per project that owns context and state
+- Event-driven workflows instead of manual updates
+- AI-owned information flow, human-owned judgment
+- Leadership clarity without additional meetings
 
 ---
 
-## Core Design Principles
+## 🔁 Core Loop (The Heart of the System)
 
-1. **From Scratch, Not Automation**  
-   Legacy workflows are removed, not optimized.
+1. **Request / Signal**
+2. **Orchestrator AI** plans work
+3. **Team Builder AI** assigns people
+4. **Scheduler AI** proposes timelines
+5. **Humans execute**
+6. **Events emitted**
+7. **Project AI** updates system truth
+8. **Leadership has clarity**
+9. **Replan automatically if needed**
 
-2. **AI Owns State**  
-   Humans do not maintain status, reports, or coordination.
-
-3. **Humans Own Judgment**  
-   AI never makes irreversible or ethical decisions.
-
-4. **Event-Driven Reality**  
-   Every action updates the system automatically.
-
-5. **Limited AI Communication**  
-   Project AIs only share necessary information with related projects.
+> If a feature breaks this loop, it does not belong in the system.
 
 ---
 
-## Human vs AI Responsibilities
+## 🧠 Key Concepts
 
-### AI Owns
-- Applicant evaluation and sorting
+### AI as a Team Member
+
+Each project has a dedicated AI that:
+
+- Knows goals, decisions, tasks, risks, and dependencies
+- Processes employee updates and customer issues
+- Maintains live project truth
+
+Humans never need to “bring the AI up to speed.”
+
+### Meeting-Minimized by Design
+
+- Meetings are not banned — they are compressed into signals.
+- Meetings → decisions  
+    AI → persistent system state  
+    Leadership → clarity without follow-ups
+
+### Event-Driven Everything
+
+- Nothing is manually reported.
+- Everything is an event:
+    - Requests
+    - Assignments
+    - Execution updates
+    - Decisions
+
+Events are the single source of truth.
+
+---
+
+## 🏗️ System Components
+
+1. **Event Intake Layer**  
+     Receives structured events from:
+     - Employees
+     - Customers
+     - Leadership
+
+2. **Orchestrator AI**  
+     - Breaks high-level requests into sub-tasks
+     - Estimates risk and impact
+     - Produces structured plans (JSON, not prose)
+
+3. **Team Builder AI**  
+     Assigns people based on:
+     - Skills
+     - Workload
+     - Project relevance  
+     Always provides rationale
+
+4. **Scheduler AI**  
+     - Proposes timelines and task ordering
+     - Respects availability (mocked in MVP)
+
+5. **Project AI (State Owner)**  
+     Owns project truth:
+     - Progress
+     - Risk
+     - Blockers
+     - Dependencies  
+     Updates state only via events
+
+6. **Leadership View**  
+     - Read-only
+     - Shows:
+         - What’s happening
+         - Why it’s happening
+         - What changed  
+     Enables fast reprioritization or rollback
+
+---
+
+## 📦 MVP Scope
+
+**Included**
+
+- Event schemas
+- AI orchestration logic
+- Team selection & scheduling logic
 - Project state tracking
-- Dependency and risk detection
-- Decision memory and consistency
-- Productivity signal aggregation
+- Leadership summary view
+- Mock data & simulated workflows
 
-### Humans Own
-- Hiring approvals
-- Strategic direction
-- Ethical review
-- Overrides and corrections
-- Accountability for outcomes
+**Explicitly Not Included**
 
-AI **supports decisions** but does not replace responsibility.
+- Authentication
+- Real integrations (Slack, Jira, Calendars)
+- Performance tracking of individuals
+- Autonomous decision-making
+- Surveillance features
 
 ---
 
-## End-to-End Demo Flow
+## 🛠️ Tech Stack (MVP)
 
-1. A new project is created
-2. Project AI defines required skills and constraints
-3. Applicants submit work samples (not resumes)
-4. Hiring AI evaluates and ranks candidates with explanations
-5. A human approves the hire
-6. Employee actions generate events (task updates, blockers, commits)
-7. Project AI updates timelines and risk automatically
-8. Meeting AI listens to discussions and records decisions
-9. Leadership views real-time productivity and system health
-10. Leadership reprioritizes or dismisses projects with context
+- **Backend:** Node.js + Express
+- **AI:** OpenAI API (replaceable later)
+- **State:** In-memory / JSON (MongoDB-ready)
+- **Frontend:** Minimal HTML / EJS / React
+- **Architecture:** Event-driven
 
 ---
 
-## Key Components
+## 📁 Project Structure
 
-### Hiring AI
-- Matches people to **projects**, not titles
-- Explains why a candidate is a fit or risk
-
-### Project AI
-- Acts as a permanent team member
-- Knows goals, history, and decisions
-
-### Meeting AI
-- Eliminates meeting notes and follow-ups
-- Prevents decision loss and contradictions
-
-### Employee State AI
-- Updates skills, availability, and workload automatically
-- Detects overload or underutilization
-
----
-
-## Architecture (High Level)
-
-- **Frontend**
-  - Simple web interface for employees and leadership
-- **Backend**
-  - API handling events and state updates
-- **AI Layer**
-  - Large Language Model with structured prompts
-  - Memory per project and employee
-- **Data Layer**
-  - Mock or lightweight storage for demo purposes
-
-The focus is on **logic and responsibility**, not infrastructure scale.
+```
+ai-native-org-os/
+├── README.md
+├── docs/
+│   ├── principles.md
+│   ├── architecture.md
+│   ├── event-model.md
+│   └── demo-script.md
+├── server/
+│   ├── index.js
+│   ├── routes/
+│   ├── services/
+│   │   ├── orchestratorAI.js
+│   │   ├── teamBuilderAI.js
+│   │   ├── schedulerAI.js
+│   │   └── projectAI.js
+│   └── models/
+├── mock-data/
+└── client/
+```
 
 ---
 
-## Limitations
+## 🎬 Demo Scenario
 
-- This is a **conceptual demo**, not a production HR system
-- Uses simulated data and simplified workflows
-- AI decisions may be incorrect and require human correction
-- Does not integrate with real payroll or legal systems
+1. Customer reports a critical bug
+2. Orchestrator AI breaks it into tasks
+3. Team Builder assigns best-fit engineers
+4. Scheduler proposes timeline
+5. Execution events update project state
+6. Leadership sees risk drop in real time
 
-These limitations are intentional to focus on system design.
-
----
-
-## Future Improvements
-
-- Multi-company and multi-department support
-- Bias detection and fairness auditing
-- Permission-based AI memory access
-- Deeper performance modeling
-- Integration with real communication tools
+_No status meetings occurred_
 
 ---
 
-## Disclaimer
+## 🧭 Design Principles
 
-This project is a **design and systems demonstration**.  
-It is **not** intended for real hiring, HR decisions, or employee evaluation without extensive validation, legal review, and ethical safeguards.
+- AI owns information flow
+- Humans own judgment
+- Everything is explainable
+- Meetings are minimized structurally
+- Clarity over features
 
 ---
 
-### Final Note
+## ⚠️ Ethics & Guardrails
 
-This project explores **how organizations should work in an AI-native world**, not how to add AI to existing workflows.
+- AI never evaluates human worth
+- No silent decisions
+- All AI outputs include rationale
+- Humans can override at any point
+
+---
+
+## 🎯 Why This Project Matters
+
+This project demonstrates:
+
+- AI-native system design
+- Strong systems thinking
+- Organizational awareness
+- Product + engineering maturity
+
+_It is not a chatbot demo —  
+it is a new operating model._
+
+---
+
+## 🚀 Status
+
+🟡 **In active development**  
+Currently building:
+
+- Event models
+- Orchestration loop
+- AI prompt templates
+
+---
+
+## 📌 Final Note
+
+This project is not about replacing humans.  
+It is about removing coordination friction so humans can do meaningful work.
