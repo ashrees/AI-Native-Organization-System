@@ -1,0 +1,460 @@
+/* Minimal styling for Leadership View. Read-only; no micromanagement UI. */
+:root {
+  font-family: system-ui, -apple-system, sans-serif;
+  line-height: 1.5;
+  color: #1a1a1a;
+  background: #e8eaed;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 1rem 1.5rem;
+  min-height: 100vh;
+}
+
+.app-header {
+  background: #fff;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  margin-bottom: 1rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+
+.app-header h1 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin: 0 0 0.25rem 0;
+}
+
+.app .subtitle {
+  color: #5f6368;
+  font-size: 0.875rem;
+  margin-bottom: 1rem;
+}
+
+.app-nav {
+  display: flex;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+}
+
+.nav-tab {
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #5f6368;
+  background: transparent;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.nav-tab:hover {
+  background: #f1f3f4;
+  color: #202124;
+}
+
+.nav-tab.active {
+  background: #1a73e8;
+  color: #fff;
+}
+
+.nav-badge {
+  font-size: 0.7rem;
+  background: rgba(0,0,0,0.15);
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+}
+
+.nav-tab.active .nav-badge {
+  background: rgba(255,255,255,0.35);
+}
+
+.app-status {
+  margin: 0 0 0.5rem 0;
+  font-size: 0.875rem;
+}
+
+.app-main {
+  background: #fff;
+  border-radius: 10px;
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+}
+
+.app-section {
+  margin: 0;
+}
+
+.section-title {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem 0;
+  color: #202124;
+}
+
+.section-desc {
+  font-size: 0.8rem;
+  color: #5f6368;
+  margin: 0 0 1rem 0;
+}
+
+.projects {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.project-card {
+  background: #f8f9fa;
+  border: 1px solid #e8eaed;
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.project-card h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 0.25rem 0;
+}
+
+.project-card .meta {
+  font-size: 0.75rem;
+  color: #666;
+  margin-bottom: 0.75rem;
+}
+
+.project-card .meta-line {
+  display: block;
+}
+
+.risk {
+  font-size: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.risk.high { color: #c00; }
+.risk.medium { color: #b8860b; }
+.risk.low { color: #0a0; }
+
+.tasks {
+  margin: 0.5rem 0;
+  padding-left: 1rem;
+}
+
+.tasks li {
+  margin: 0.25rem 0;
+  font-size: 0.875rem;
+}
+
+.task-title {
+  font-weight: 500;
+}
+
+.task-status {
+  color: #555;
+}
+
+.task-assignee {
+  font-size: 0.8rem;
+  color: #444;
+}
+
+.task-schedule {
+  font-size: 0.8rem;
+  color: #666;
+}
+
+.blockers {
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: #fff5f5;
+  border-radius: 4px;
+  font-size: 0.875rem;
+}
+
+.recent-events {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #eee;
+  font-size: 0.75rem;
+  color: #555;
+}
+
+.recent-events dt {
+  font-weight: 500;
+  margin-top: 0.25rem;
+}
+
+.recent-events dd {
+  margin: 0 0 0 1rem;
+}
+
+/* Log tab */
+.log-section .section-desc {
+  margin-bottom: 1rem;
+}
+
+.log-project-label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 1rem;
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: #202124;
+}
+
+.log-project-select {
+  max-width: 20rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.875rem;
+  border: 1px solid #dadce0;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.log-entries {
+  margin-top: 0.5rem;
+}
+
+.log-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.log-entry {
+  padding: 0.65rem 0.75rem;
+  margin-bottom: 0.5rem;
+  background: #f8f9fa;
+  border: 1px solid #e8eaed;
+  border-radius: 8px;
+  font-size: 0.875rem;
+}
+
+.log-entry .log-meta {
+  display: block;
+  color: #5f6368;
+  margin-bottom: 0.25rem;
+}
+
+.log-entry .log-meta strong {
+  color: #202124;
+}
+
+.log-entry .log-message {
+  display: block;
+  color: #202124;
+  max-width: 72ch;
+}
+
+.loading, .error {
+  padding: 1rem;
+  text-align: center;
+  color: #666;
+}
+
+.error {
+  color: #c00;
+}
+
+.empty {
+  color: #888;
+  font-size: 0.875rem;
+}
+
+.submit-event {
+  margin-top: 0;
+  padding: 1rem 1.25rem;
+  background: #f8f9fa;
+  border: 1px solid #e8eaed;
+  border-radius: 8px;
+}
+
+.action-card .submit-event-desc {
+  margin-bottom: 0.75rem;
+}
+
+.actions-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+}
+
+@media (max-width: 700px) {
+  .actions-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.submit-event h2,
+.submit-event h3 {
+  font-size: 0.95rem;
+  margin: 0 0 0.25rem 0;
+}
+
+.submit-event-desc {
+  font-size: 0.75rem;
+  color: #666;
+  margin-bottom: 1rem;
+}
+
+.submit-event form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: flex-end;
+}
+
+.submit-event label {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.75rem;
+  color: #555;
+}
+
+.submit-event select,
+.submit-event input {
+  margin-top: 0.25rem;
+  padding: 0.35rem 0.5rem;
+  font-size: 0.875rem;
+}
+
+.submit-event button {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.submit-ok {
+  margin-top: 0.5rem;
+  color: #0a0;
+  font-size: 0.875rem;
+}
+
+.org-insights {
+  margin-top: 0;
+  margin-bottom: 0;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  font-size: 0.85rem;
+}
+
+.org-insights-inner {
+  padding: 0;
+}
+
+.org-insights h2,
+.org-insights h3 {
+  font-size: 0.95rem;
+  margin: 0 0 0.5rem 0;
+}
+
+.org-insights-desc {
+  margin: 0 0 0.75rem 0;
+  color: #666;
+  font-size: 0.75rem;
+}
+
+.org-section + .org-section {
+  margin-top: 1rem;
+}
+
+.org-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.org-item {
+  padding: 0.5rem 0;
+  border-top: 1px solid #f0f0f0;
+}
+
+.org-item:first-child {
+  border-top: none;
+}
+
+.org-item-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.25rem;
+}
+
+/* Status lights in Overview: killed = red, risk = yellow, good = green */
+.status-dot {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.9);
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.15);
+}
+
+.status-dot--red {
+  background: #ea4335;
+  box-shadow: 0 0 12px 3px rgba(234, 67, 53, 0.6), 0 0 0 1px rgba(0,0,0,0.15);
+}
+
+.status-dot--yellow {
+  background: #fbbc04;
+  box-shadow: 0 0 12px 3px rgba(251, 188, 4, 0.65), 0 0 0 1px rgba(0,0,0,0.15);
+}
+
+.status-dot--green {
+  background: #34a853;
+  box-shadow: 0 0 12px 3px rgba(52, 168, 83, 0.5), 0 0 0 1px rgba(0,0,0,0.15);
+}
+
+.org-tag {
+  padding: 0.1rem 0.4rem;
+  border-radius: 999px;
+  background: #eef;
+  color: #334;
+  font-size: 0.7rem;
+  text-transform: lowercase;
+}
+
+.org-risk {
+  font-size: 0.7rem;
+  text-transform: lowercase;
+}
+
+.org-risk.high {
+  color: #c00;
+}
+
+.org-risk.medium {
+  color: #b8860b;
+}
+
+.org-risk.low {
+  color: #0a0;
+}
+
+.org-sublist,
+.org-suggestions {
+  margin: 0.25rem 0 0.25rem 1rem;
+  padding-left: 0.75rem;
+}
+
+.org-summary {
+  margin: 0.25rem 0;
+}
+
+.org-note {
+  color: #555;
+}

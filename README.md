@@ -148,9 +148,9 @@ Events are the single source of truth.
 ## 🛠️ Tech Stack (MVP)
 
 - **Backend:** Node.js + Express
-- **AI:** OpenAI API (replaceable later)
+- **AI:** Google Gemini API or OpenAI API, selected via a shared LLM helper (set one API key; see below)
 - **State:** In-memory / JSON (MongoDB-ready)
-- **Frontend:** Minimal HTML / EJS / React
+- **Frontend:** React
 - **Architecture:** Event-driven
 
 ---
@@ -158,25 +158,91 @@ Events are the single source of truth.
 ## 📁 Project Structure
 
 ```
-ai-native-org-os/
+AI-Native-Organization-System/
 ├── README.md
 ├── docs/
 │   ├── principles.md
 │   ├── architecture.md
-│   ├── event-model.md
-│   └── demo-script.md
+│   ├── event-model.md          # Event schema + Project State (source of truth)
+│   └── orchestration-loop.md   # Main loop pseudocode
 ├── server/
-│   ├── index.js
+│   ├── index.js                # Express app + CORS
 │   ├── routes/
+│   │   └── events.js           # POST/GET /events, GET /events/projects
 │   ├── services/
 │   │   ├── orchestratorAI.js
 │   │   ├── teamBuilderAI.js
 │   │   ├── schedulerAI.js
 │   │   └── projectAI.js
-│   └── models/
-├── mock-data/
-└── client/
+│   ├── models/
+│   │   ├── eventSchema.js     # Validation + constants
+│   │   └── projectState.js    # Apply events → state
+│   └── store/                  # Postgres persistence
+│       └── postgresStore.js    # events, projects, people tables
+├── prompts/                    # AI prompt templates
+│   ├── orchestrator.txt
+│   ├── teamBuilder.txt
+│   ├── scheduler.txt
+│   └── projectAI.txt
+└── client/                     # React Leadership View (Vite)
+    ├── src/
+    │   ├── App.jsx
+    │   └── main.jsx
+    └── index.html
 ```
+
+---
+
+## 🚀 Getting Started
+
+**Prerequisites:** Node.js 18+ (Node 20+ recommended for Google Gen AI SDK)
+
+1. **Install dependencies**
+   ```bash
+   cd server && npm install
+   cd ../client && npm install
+   ```
+
+2. **(Required) Set DATABASE_URL** — Postgres is the only store (events, projects, people). Default people are seeded automatically when the people table is empty.
+   ```bash
+   export DATABASE_URL='postgresql://user:pass@host/db?sslmode=require'
+   # or add to .env in project root
+   ```
+
+3. **(Optional) Set AI API key** — use Google Gemini or OpenAI; without a key, stub AI runs.
+   ```bash
+   export GOOGLE_API_KEY='your-gemini-api-key'   # from https://aistudio.google.com/apikey
+   # or
+   export OPENAI_API_KEY='your-openai-key'
+   ```
+
+4. **Run the API server** (port 3000)
+   ```bash
+   node server/index.js
+   ```
+
+5. **Run the Leadership View** (port 5173)
+   ```bash
+   cd client && npm run dev
+   ```
+   Open http://localhost:5173 — read-only view of projects, tasks, risk, blockers, and recent events.
+
+6. **Submit a request event**
+   ```bash
+   curl -X POST http://localhost:3000/events \
+     -H "Content-Type: application/json" \
+     -d '{"id":"<UUID>","type":"request","timestamp":"<ISO8601>","projectId":"proj-1","source":"human","payload":{"title":"Fix login bug","priority":"high"}}'
+   ```
+
+**API (no auth in MVP)**
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST   | /events | Submit an event (validate, persist, apply). If `type` is `request`, orchestration runs and derived events are emitted. |
+| GET    | /events | List recent events (optional `?projectId=`). |
+| GET    | /events/projects | List all project states. |
+| GET    | /events/projects/:id | Get one project state. |
+| GET    | /health | Health check. |
 
 ---
 
@@ -228,12 +294,14 @@ it is a new operating model._
 
 ## 🚀 Status
 
-🟡 **In active development**  
-Currently building:
+🟢 **MVP in place**
 
-- Event models
-- Orchestration loop
-- AI prompt templates
+- **Done:** Event schemas, Project State model, event intake, persistence (JSON store)
+- **Done:** Orchestration loop — on `request` events: Orchestrator → Team Builder → Scheduler; plan_created, assignment, schedule_proposed emitted and applied
+- **Done:** Project AI apply logic (state updated only via events)
+- **Done:** Leadership View (React, read-only: what’s happening, why, what changed)
+- **Done:** Prompts and mock data (people, sample events)
+- **Next:** Wire AI services to OpenAI (or replaceable LLM); optional replan triggers; execution/decision events from UI
 
 ---
 

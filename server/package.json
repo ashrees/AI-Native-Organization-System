@@ -1,0 +1,19 @@
+{
+  "name": "ai-native-org-server",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "@google/genai": "^1.43.0",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "openai": "^4.52.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
