@@ -6,7 +6,9 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node server/index.js"
+    "dev": "node server/index.js",
+    "dev:client": "npm run dev --prefix client",
+    "dev:worker": "npm run dev --prefix worker"
   },
   "engines": {
     "node": ">=18"

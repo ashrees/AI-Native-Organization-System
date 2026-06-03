@@ -494,4 +494,148 @@ async function complete(systemPrompt, userMessage, options = {}) {
   });
 }
 
-module.exports = { readPrompt, complete, OLLAMA_TOOLS };
+function buildChatMessages(systemPrompt, userMessage, options = {}) {
+  const history = Array.isArray(options.messages) ? options.messages : [];
+  const msgs = [{ role: 'system', content: systemPrompt }];
+  for (const m of history.slice(-8)) {
+    if (!m?.content || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    msgs.push({ role: m.role, content: String(m.content).slice(0, 4000) });
+  }
+  msgs.push({ role: 'user', content: userMessage });
+  return msgs;
+}
+
+async function completeTextWithOllama(systemPrompt, userMessage, options = {}) {
+  const baseUrl = cleanEnvValue(process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/$/, '');
+  const modelSpec = cleanEnvValue(options.model || process.env.OLLAMA_MODEL || 'llama3.1:8b');
+  const modelCandidates = modelSpec.split(',').map((s) => cleanEnvValue(s)).filter(Boolean);
+  const timeoutMs = options.timeoutMs ?? 90000;
+  const messages = buildChatMessages(systemPrompt, userMessage, options);
+
+  for (const model of modelCandidates) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(`${baseUrl}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          messages,
+          stream: false,
+          options: { temperature: 0.3, num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 2048) },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) continue;
+      const data = await res.json();
+      const text = data?.message?.content;
+      if (text && typeof text === 'string' && text.trim()) return text.trim();
+    } catch (err) {
+      if (modelCandidates.indexOf(model) < modelCandidates.length - 1) continue;
+      console.error('Ollama completeText error:', err.message);
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return null;
+}
+
+async function completeTextWithOpenAI(systemPrompt, userMessage, options = {}) {
+  const apiKey = cleanEnvValue(process.env.OPENAI_API_KEY);
+  if (!apiKey) return null;
+  try {
+    const OpenAI = require('openai');
+    const client = new OpenAI({ apiKey });
+    const model = cleanEnvValue(options.model || 'gpt-4o-mini');
+    const response = await client.chat.completions.create({
+      model,
+      messages: buildChatMessages(systemPrompt, userMessage, options),
+      temperature: 0.3,
+    });
+    const content = response.choices?.[0]?.message?.content;
+    return content && typeof content === 'string' ? content.trim() : null;
+  } catch (err) {
+    console.error('OpenAI completeText error:', err.message);
+    return null;
+  }
+}
+
+async function completeTextWithGoogle(systemPrompt, userMessage, options = {}) {
+  const apiKey = cleanEnvValue(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY);
+  if (!apiKey) return null;
+  try {
+    const { GoogleGenAI } = await import('@google/genai');
+    const ai = new GoogleGenAI({ apiKey });
+    const model = cleanEnvValue(options.model || 'gemini-2.0-flash');
+    const history = (options.messages || []).slice(-8);
+    const contents = [
+      ...history
+        .filter((m) => m.role === 'user' || m.role === 'assistant')
+        .map((m) => ({
+          role: m.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: String(m.content).slice(0, 4000) }],
+        })),
+      { role: 'user', parts: [{ text: userMessage }] },
+    ];
+    const response = await ai.models.generateContent({
+      model,
+      contents,
+      systemInstruction: systemPrompt,
+      generationConfig: { temperature: 0.3 },
+    });
+    const text = response?.text;
+    return text && typeof text === 'string' ? text.trim() : null;
+  } catch (err) {
+    console.error('Google completeText error:', err.message);
+    return null;
+  }
+}
+
+/**
+ * Plain-text LLM completion for help chat (not JSON). Uses same provider order as complete().
+ */
+async function completeText(systemPrompt, userMessage, options = {}) {
+  return withModelLock(async () => {
+    const providerPref = cleanEnvValue(process.env.LLM_PROVIDER || '').toLowerCase();
+    const maxAttempts = Math.min(3, LLM_MAX_RETRIES);
+
+    async function tryOnce() {
+      if (providerPref === 'google') return completeTextWithGoogle(systemPrompt, userMessage, options);
+      if (providerPref === 'openai') return completeTextWithOpenAI(systemPrompt, userMessage, options);
+      if (providerPref === 'ollama') return completeTextWithOllama(systemPrompt, userMessage, options);
+      if (cleanEnvValue(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY)) {
+        const r = await completeTextWithGoogle(systemPrompt, userMessage, options);
+        if (r) return r;
+      }
+      if (cleanEnvValue(process.env.OPENAI_API_KEY)) {
+        const r = await completeTextWithOpenAI(systemPrompt, userMessage, options);
+        if (r) return r;
+      }
+      return completeTextWithOllama(systemPrompt, userMessage, options);
+    }
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const result = await tryOnce();
+      if (result) {
+        await logLlmInteraction({
+          agent: options.agent || 'help_chat',
+          provider: providerPref || 'auto',
+          model: options.model || null,
+          projectId: options.projectId || null,
+          context: 'help_chat',
+          systemPrompt,
+          userMessage,
+          rawResponse: result,
+          parsedJson: null,
+          error: null,
+        });
+        return result;
+      }
+      if (attempt < maxAttempts) await delay(LLM_RETRY_DELAY_MS);
+    }
+    return null;
+  });
+}
+
+module.exports = { readPrompt, complete, completeText, OLLAMA_TOOLS };

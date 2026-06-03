@@ -17,7 +17,9 @@ if (!process.env.DATABASE_URL) {
 const express = require('express');
 const cors = require('cors');
 const eventsRouter = require('./routes/events');
+const workerRouter = require('./routes/worker');
 const orgInsightsRouter = require('./routes/orgInsights');
+const helpChatRouter = require('./routes/helpChat');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,9 +31,16 @@ app.use(express.json());
 app.use('/events', eventsRouter);
 app.use('/api/events', eventsRouter);
 
+// Human Worker Portal API (separate frontend in worker/)
+app.use('/worker', workerRouter);
+app.use('/api/worker', workerRouter);
+
 // Org-level metrics and AI insights (same Postgres store)
 app.use('/org-insights', orgInsightsRouter);
 app.use('/api/org-insights', orgInsightsRouter);
+
+app.use('/help-chat', helpChatRouter);
+app.use('/api/help-chat', helpChatRouter);
 
 // Health/debug
 const healthPayload = () => ({

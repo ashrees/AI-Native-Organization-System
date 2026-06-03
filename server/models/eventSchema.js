@@ -8,6 +8,7 @@ const EVENT_TYPES = Object.freeze([
   'request',
   'plan_created',
   'assignment',
+  'unassignment',
   'schedule_proposed',
   'execution',
   'decision',

@@ -15,6 +15,7 @@ const orchestratorAI = require('../services/orchestratorAI');
 const teamBuilderAI = require('../services/teamBuilderAI');
 const schedulerAI = require('../services/schedulerAI');
 const agentActivityLog = require('../lib/agentActivityLog');
+const { scheduleProjectAIReevaluation } = require('../services/projectAIEvaluator');
 const { buildAllProjectMetrics } = require('../services/metrics');
 const { buildAgentContext } = require('../services/retrieval');
 const postgresStore = require('../store/postgresStore');
@@ -80,6 +81,13 @@ async function initStore() {
     peopleCache = await postgresStore.loadAllPeople();
   }
   console.log(`[Store] Loaded ${eventLog.length} events, ${Object.keys(projects).length} projects, ${peopleCache.length} people.`);
+
+  try {
+    const { reconcileApprovedWorkerRequests } = require('../lib/reconcileApprovedRequests');
+    await reconcileApprovedWorkerRequests(router);
+  } catch (err) {
+    console.warn('[Store] Approved request reconciliation skipped:', err.message);
+  }
 }
 
 /**
@@ -414,6 +422,10 @@ router.post('/', async (req, res) => {
     }
   }
 
+  if (event.type === 'execution' && event.source === 'human') {
+    afterHumanExecution(event);
+  }
+
   // Optional replan: on blocker or reprioritize, emit a system request and run orchestration once
   const projectState = projects[event.projectId];
   if (projectState && projectState.status === 'active') {
@@ -447,47 +459,55 @@ router.post('/', async (req, res) => {
 });
 
 /**
- * POST /events/worker/status — Working-person updates their assigned task status.
- * Body: { projectId, taskId, personId, status [, notes] }
- * status: one of 'in_progress' | 'done' | 'blocked'. notes optional (recommended when status is 'blocked').
- * Only the assignee (task.assigneeId === personId) may update; returns 403 otherwise.
+ * Worker task status update (shared by /events/worker/status and /worker/status).
+ * @returns {{ status: number, body: object }}
  */
-router.post('/worker/status', async (req, res) => {
-  const { projectId, taskId, personId, status, notes } = req.body || {};
+async function submitWorkerStatus(body) {
+  const { projectId, taskId, personId, status, notes } = body || {};
   if (!projectId || typeof projectId !== 'string' || !projectId.trim()) {
-    return res.status(400).json({ error: 'projectId is required' });
+    return { status: 400, body: { error: 'projectId is required' } };
   }
   if (!taskId || typeof taskId !== 'string' || !taskId.trim()) {
-    return res.status(400).json({ error: 'taskId is required' });
+    return { status: 400, body: { error: 'taskId is required' } };
   }
   if (!personId || typeof personId !== 'string' || !personId.trim()) {
-    return res.status(400).json({ error: 'personId is required' });
+    return { status: 400, body: { error: 'personId is required' } };
   }
   if (!status || !EXECUTION_STATUSES.includes(status)) {
-    return res.status(400).json({
-      error: `status must be one of: ${EXECUTION_STATUSES.join(', ')}`,
-    });
+    return {
+      status: 400,
+      body: { error: `status must be one of: ${EXECUTION_STATUSES.join(', ')}` },
+    };
   }
 
   const projectState = projects[projectId];
   if (!projectState) {
-    return res.status(404).json({ error: 'Project not found' });
+    return { status: 404, body: { error: 'Project not found' } };
   }
   if (projectState.status !== 'active') {
-    return res.status(400).json({
-      error: `Project is ${projectState.status}; cannot update task status`,
-    });
+    return {
+      status: 400,
+      body: { error: `Project is ${projectState.status}; cannot update task status` },
+    };
   }
 
   const task = findTask(projectState, taskId);
   if (!task) {
-    return res.status(404).json({ error: 'Task not found in project' });
+    return { status: 404, body: { error: 'Task not found in project' } };
   }
   const assigneeId = task.assigneeId || (task.assignee && task.assignee.id) || null;
   if (assigneeId !== personId) {
-    return res.status(403).json({
-      error: 'Only the assigned person may update this task status',
-    });
+    return { status: 403, body: { error: 'Only the assigned person may update this task status' } };
+  }
+  const worker = peopleCache.find((p) => p.id === personId);
+  const { personCanWork } = require('../services/emergencyReturn');
+  if (worker && !personCanWork(worker)) {
+    return {
+      status: 403,
+      body: {
+        error: `${worker.name} is on leave. HR must authorize emergency return before task updates.`,
+      },
+    };
   }
 
   const event = {
@@ -496,7 +516,11 @@ router.post('/worker/status', async (req, res) => {
     timestamp: new Date().toISOString(),
     projectId,
     source: 'human',
-    payload: { taskId, status, notes: notes != null && String(notes).trim() !== '' ? String(notes).trim() : undefined },
+    payload: {
+      taskId,
+      status,
+      notes: notes != null && String(notes).trim() !== '' ? String(notes).trim() : undefined,
+    },
   };
 
   eventLog.push(event);
@@ -509,31 +533,36 @@ router.post('/worker/status', async (req, res) => {
   }
 
   const projectStateAfter = projects[projectId];
-  if (projectStateAfter && projectStateAfter.status === 'active') {
-    const shouldReplan = status === 'blocked';
-    if (shouldReplan) {
-      const replanRequest = {
-        id: crypto.randomUUID(),
-        type: 'request',
-        timestamp: new Date().toISOString(),
-        projectId,
-        source: 'system',
-        correlationId: event.id,
-        rationale: `Replan: blocker on task ${taskId}`,
-        payload: {
-          title: 'Replan after blocker',
-          description: notes || `Task ${taskId} marked blocked`,
-          priority: 'high',
-        },
-      };
-      await emitEvent(replanRequest);
-      handleRequestFlow(replanRequest).catch((err) => {
-        console.error('Replan orchestration error:', err);
-      });
-    }
+  afterHumanExecution(event);
+
+  if (projectStateAfter && projectStateAfter.status === 'active' && status === 'blocked') {
+    const replanRequest = {
+      id: crypto.randomUUID(),
+      type: 'request',
+      timestamp: new Date().toISOString(),
+      projectId,
+      source: 'system',
+      correlationId: event.id,
+      rationale: `Replan: blocker on task ${taskId}`,
+      payload: {
+        title: 'Replan after blocker',
+        description: notes || `Task ${taskId} marked blocked`,
+        priority: 'high',
+      },
+    };
+    await emitEvent(replanRequest);
+    handleRequestFlow(replanRequest).catch((err) => {
+      console.error('Replan orchestration error:', err);
+    });
   }
 
-  return res.status(201).json({ accepted: true, id: event.id });
+  return { status: 201, body: { accepted: true, id: event.id } };
+}
+
+/** POST /events/worker/status — legacy path for worker apps */
+router.post('/worker/status', async (req, res) => {
+  const result = await submitWorkerStatus(req.body);
+  return res.status(result.status).json(result.body);
 });
 
 /**
@@ -589,8 +618,30 @@ router.get('/agent-activity', (req, res) => {
 /**
  * GET /projects — list current project state (for leadership view / debug).
  */
+function enrichProjectStateForView(state) {
+  const peopleById = new Map(peopleCache.map((p) => [p.id, p]));
+  const tasks = (state.progress?.tasks || []).map((t) => {
+    const aid = t.assigneeId || t.assignee?.id;
+    const person = aid ? peopleById.get(aid) : null;
+    const onLeave = person?.availabilityStatus === 'on_leave';
+    const onEmergency = person?.availabilityStatus === 'emergency_active';
+    if (!onLeave) return t;
+    if (onEmergency) return t;
+    return {
+      ...t,
+      assignee: null,
+      assigneeId: null,
+      assigneeNote: `${person.name} (on leave)`,
+    };
+  });
+  return {
+    ...state,
+    progress: { ...state.progress, tasks },
+  };
+}
+
 router.get('/projects', (req, res) => {
-  res.json({ projects: Object.values(projects) });
+  res.json({ projects: Object.values(projects).map(enrichProjectStateForView) });
 });
 
 /**
@@ -607,16 +658,44 @@ router.get('/projects/:id', (req, res) => {
 /**
  * GET /needs — list needs from DB. Optional ?projectId= & ?status= (open|met|cancelled).
  */
+function enrichNeedsFromEventLog(rows) {
+  const people = loadPeople();
+  const peopleById = new Map(people.map((p) => [p.id, p]));
+  return rows.map((row) => {
+    const ev = eventLog.find((e) => e.id === row.id || e.id === row.eventId);
+    const p = ev?.payload || {};
+    const submitter = peopleById.get(p.personId);
+    return {
+      ...row,
+      title: p.title || row.kind,
+      handlingMode: p.handlingMode,
+      routingLabel: p.routingLabel,
+      forwardsTo: p.forwardsTo,
+      forwardTargets: p.forwardTargets || p.notifyTargets,
+      roleAssignments: p.roleAssignments,
+      status: p.status || row.status,
+      reviewNotes: p.reviewNotes,
+      reviewedBy: p.reviewedBy,
+      reviewedByName: p.reviewedByName || (p.reviewedBy === 'leadership' ? 'Leadership' : submitter?.name),
+      reviewedAt: p.reviewedAt,
+      submitterName: submitter?.name,
+      requiresHrInbox: p.requiresHrInbox,
+      effectsApplied: p.effectsApplied,
+      reviewedByName: p.reviewedByName,
+    };
+  });
+}
+
 router.get('/needs', async (req, res) => {
   try {
     const { projectId, status } = req.query;
     if (projectId) {
       const list = await postgresStore.loadNeedsByProject(projectId);
       const filtered = status ? list.filter((n) => n.status === status) : list;
-      return res.json({ needs: filtered });
+      return res.json({ needs: enrichNeedsFromEventLog(filtered) });
     }
     const list = await postgresStore.loadAllNeeds(status ? { status } : {});
-    res.json({ needs: list });
+    res.json({ needs: enrichNeedsFromEventLog(list) });
   } catch (err) {
     console.error('GET /needs error:', err);
     res.status(500).json({ error: 'Failed to load needs' });
@@ -637,24 +716,78 @@ router.get('/projects/:id/needs', async (req, res) => {
 });
 
 /**
- * PATCH /needs/:id — update need status. Body: { status: 'open' | 'met' | 'cancelled' }.
+ * PATCH /needs/:id — update need / worker request status.
+ * Body: { status, reviewNotes?, reviewedBy? }
  */
 router.patch('/needs/:id', async (req, res) => {
-  const { status } = req.body || {};
-  if (!status || !['open', 'met', 'cancelled'].includes(status)) {
-    return res.status(400).json({ error: 'status must be one of: open, met, cancelled' });
+  const { status, reviewNotes, reviewedBy } = req.body || {};
+  const { NEED_STATUSES } = require('../constants/workerRequests');
+  const { applyWorkerRequestReview } = require('../lib/workerRequestLifecycle');
+  if (!status || !NEED_STATUSES.includes(status)) {
+    return res.status(400).json({
+      error: `status must be one of: ${NEED_STATUSES.join(', ')}`,
+    });
   }
   try {
-    const updated = await postgresStore.updateNeedStatus(req.params.id, status);
+    const idx = eventLog.findIndex((e) => e.id === req.params.id && e.type === 'need');
+    if (idx < 0) {
+      return res.status(404).json({ error: 'Need not found' });
+    }
+    const needEvent = eventLog[idx];
+    const terminal = ['approved', 'rejected', 'met', 'cancelled'].includes(status);
+
+    if (terminal) {
+      const reviewer =
+        reviewedBy === 'leadership'
+          ? { id: 'leadership', name: 'Leadership' }
+          : loadPeople().find((p) => p.id === reviewedBy);
+      if (reviewer) {
+        await applyWorkerRequestReview(
+          needEvent,
+          { status, reviewNotes, reviewedAt: new Date().toISOString() },
+          reviewer,
+          buildWorkerRequestCtx()
+        );
+      }
+    }
+
+    const updated = await updateWorkerRequest(req.params.id, {
+      ...needEvent.payload,
+      status,
+      reviewNotes,
+      reviewedBy,
+      reviewedByName: reviewedBy === 'leadership' ? 'Leadership' : needEvent.payload.reviewedByName,
+      reviewedAt: new Date().toISOString(),
+    });
     if (!updated) {
       return res.status(404).json({ error: 'Need not found' });
     }
-    res.json(updated);
+    res.json({ event: updated, need: { id: req.params.id, status: updated.payload.status } });
   } catch (err) {
     console.error('PATCH /needs/:id error:', err);
     res.status(500).json({ error: 'Failed to update need' });
   }
 });
+
+/**
+ * Update worker request (need) in memory, project state, and Postgres.
+ */
+async function updateWorkerRequest(needId, updates) {
+  const idx = eventLog.findIndex((e) => e.id === needId && e.type === 'need');
+  if (idx < 0) return null;
+  const prev = eventLog[idx];
+  const payload = { ...prev.payload, ...updates };
+  if (updates.status) payload.status = updates.status;
+  const event = { ...prev, payload };
+  eventLog[idx] = event;
+  const projectId = event.projectId;
+  projects[projectId] = applyEvent(projects[projectId] || createEmptyState(projectId), event);
+  await postgresStore.saveProjectState(projectId, projects[projectId]);
+  await postgresStore.updateEventPayload(needId, payload, event.rationale);
+  await postgresStore.updateNeedStatus(needId, payload.status || 'open');
+  sseBroadcast('event', { id: event.id, type: event.type, projectId, timestamp: event.timestamp });
+  return event;
+}
 
 /**
  * GET /llm-logs — list LLM interaction logs. Optional ?projectId= & ?agent=.
@@ -673,6 +806,40 @@ router.get('/llm-logs', async (req, res) => {
   }
 });
 
+async function refreshPeopleCache() {
+  peopleCache = await postgresStore.loadAllPeople();
+}
+
+function buildWorkerRequestCtx() {
+  return {
+    emitEvent,
+    loadPeople,
+    getStore: () => ({ eventLog, projects }),
+    refreshPeopleCache,
+    recomputePeopleLoad: recomputePeopleLoadFromProjects,
+  };
+}
+
+function buildProjectAICtx() {
+  return {
+    emitEvent,
+    loadPeople,
+    getStore: () => ({ eventLog, projects }),
+  };
+}
+
+function afterHumanExecution(event) {
+  scheduleProjectAIReevaluation(event.projectId, event, buildProjectAICtx());
+}
+
 router.initStore = initStore;
 router.getStore = () => ({ eventLog, projects });
+router.getEventLog = () => eventLog;
+router.loadPeople = loadPeople;
+router.emitEvent = emitEvent;
+router.submitWorkerStatus = submitWorkerStatus;
+router.updateWorkerRequest = updateWorkerRequest;
+router.refreshPeopleCache = refreshPeopleCache;
+router.recomputePeopleLoadFromProjects = recomputePeopleLoadFromProjects;
+router.buildWorkerRequestCtx = buildWorkerRequestCtx;
 module.exports = router;

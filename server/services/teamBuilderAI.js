@@ -269,14 +269,22 @@ function stubAssign(task, people, projectContext = null, options = {}) {
  * @param {{ assignedInRun?: Record<string, number>, agentContext?: object }} [options] - assignedInRun; agentContext from RAG (peopleStats, projectSnapshot)
  * @returns {Promise<{ personId: string|null, rationale: string }>}
  */
+function peopleAvailableForAssignment(people) {
+  return (people || []).filter((p) => {
+    const s = p.availabilityStatus || 'active';
+    return s === 'active' || s === 'emergency_active';
+  });
+}
+
 async function assignTask(task, people, projectContext = null, options = {}) {
-  if (!people || people.length === 0) {
+  const availablePeople = peopleAvailableForAssignment(people);
+  if (!availablePeople || availablePeople.length === 0) {
     const stub = stubAssign(task, people, projectContext, options);
     return { ...stub, _usedStub: true };
   }
 
-  const { people: filteredPeople, note: filterNote } = filterPeopleByRequiredDepartments(task, people);
-  const effectivePeople = filteredPeople && filteredPeople.length > 0 ? filteredPeople : people;
+  const { people: filteredPeople, note: filterNote } = filterPeopleByRequiredDepartments(task, availablePeople);
+  const effectivePeople = filteredPeople && filteredPeople.length > 0 ? filteredPeople : availablePeople;
 
   const systemPrompt = readPrompt('teamBuilder');
   if (!systemPrompt) {

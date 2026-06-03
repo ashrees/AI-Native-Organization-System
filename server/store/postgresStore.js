@@ -115,6 +115,14 @@ function rowToPerson(r) {
     role: r.role || '',
     skills: Array.isArray(r.skills) ? r.skills : (r.skills && typeof r.skills === 'object' ? Object.values(r.skills) : []),
     currentLoad: r.current_load != null ? Number(r.current_load) : 0,
+    availabilityStatus: r.availability_status || 'active',
+    availabilityUntil: r.availability_until
+      ? r.availability_until instanceof Date
+        ? r.availability_until.toISOString()
+        : r.availability_until
+      : null,
+    availabilityReason: r.availability_reason || null,
+    activeNeedId: r.active_need_id || null,
   };
 }
 
@@ -134,11 +142,28 @@ function rowToEvent(r) {
 /**
  * Create events, projects, people, needs, project_task_index, and llm_logs tables if they do not exist. Safe for fresh start.
  */
+async function ensurePeopleAvailabilityColumns() {
+  if (!pool) return;
+  await pool.query(
+    `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS availability_status text NOT NULL DEFAULT 'active'`
+  );
+  await pool.query(
+    `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS availability_until timestamptz`
+  );
+  await pool.query(
+    `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS availability_reason text`
+  );
+  await pool.query(
+    `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS active_need_id text`
+  );
+}
+
 async function ensureTables() {
   if (!pool) return;
   await pool.query(CREATE_EVENTS);
   await pool.query(CREATE_PROJECTS);
   await pool.query(CREATE_PEOPLE);
+  await ensurePeopleAvailabilityColumns();
   await pool.query(CREATE_NEEDS);
   await pool.query(CREATE_PROJECT_TASK_INDEX);
   await pool.query(CREATE_LLM_LOGS);
@@ -163,6 +188,17 @@ async function appendEvent(event) {
       event.rationale || null,
       event.payload,
     ]
+  );
+}
+
+/**
+ * Update an existing event payload (and optional rationale) in the database.
+ */
+async function updateEventPayload(eventId, payload, rationale) {
+  if (!pool || !eventId) return;
+  await pool.query(
+    `UPDATE ${table('events')} SET payload = $2, rationale = COALESCE($3, rationale) WHERE id = $1`,
+    [eventId, payload, rationale || null]
   );
 }
 
@@ -225,13 +261,34 @@ async function upsertPerson(person) {
   const role = person.role || '';
   const skills = Array.isArray(person.skills) ? person.skills : [];
   const currentLoad = person.currentLoad != null ? Number(person.currentLoad) : 0;
+  const availabilityStatus = person.availabilityStatus || 'active';
+  const availabilityUntil = person.availabilityUntil || null;
+  const availabilityReason = person.availabilityReason || null;
+  const activeNeedId = person.activeNeedId || null;
   await pool.query(
-    `INSERT INTO ${table('people')} (id, name, department, team, role, skills, current_load)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
+    `INSERT INTO ${table('people')} (id, name, department, team, role, skills, current_load,
+       availability_status, availability_until, availability_reason, active_need_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (id)
      DO UPDATE SET name = EXCLUDED.name, department = EXCLUDED.department, team = EXCLUDED.team,
-       role = EXCLUDED.role, skills = EXCLUDED.skills, current_load = EXCLUDED.current_load`,
-    [id, name, department, team, role, JSON.stringify(skills), currentLoad]
+       role = EXCLUDED.role, skills = EXCLUDED.skills, current_load = EXCLUDED.current_load,
+       availability_status = EXCLUDED.availability_status,
+       availability_until = EXCLUDED.availability_until,
+       availability_reason = EXCLUDED.availability_reason,
+       active_need_id = EXCLUDED.active_need_id`,
+    [
+      id,
+      name,
+      department,
+      team,
+      role,
+      JSON.stringify(skills),
+      currentLoad,
+      availabilityStatus,
+      availabilityUntil,
+      availabilityReason,
+      activeNeedId,
+    ]
   );
 }
 
@@ -320,7 +377,7 @@ async function loadAllNeeds(options = {}) {
  */
 async function updateNeedStatus(needId, status) {
   if (!pool || !needId) return null;
-  const valid = ['open', 'met', 'cancelled'];
+  const valid = ['open', 'in_review', 'approved', 'rejected', 'met', 'cancelled'];
   if (!valid.includes(status)) return null;
   const { rows } = await pool.query(
     `UPDATE ${table('needs')} SET status = $1, updated_at = $2 WHERE id = $3
@@ -460,6 +517,7 @@ async function getConnectionDiagnostic() {
 module.exports = {
   ensureTables,
   appendEvent,
+  updateEventPayload,
   loadAllEvents,
   saveProjectState,
   loadAllProjects,

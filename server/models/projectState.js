@@ -125,6 +125,27 @@ function applyEvent(previousState, event) {
       break;
     }
 
+    case 'unassignment': {
+      const { taskId, personId } = payload || {};
+      if (taskId) {
+        const task = findTask(state, taskId);
+        if (
+          task &&
+          (!personId ||
+            task.assigneeId === personId ||
+            task.assignee?.id === personId)
+        ) {
+          delete task.assigneeId;
+          delete task.assignee;
+          if (task.status === 'in_progress') {
+            task.status = 'pending';
+          }
+          state.blockers = (state.blockers || []).filter((b) => b.taskId !== taskId);
+        }
+      }
+      break;
+    }
+
     case 'schedule_proposed': {
       const { taskId, proposedStart, proposedEnd } = payload || {};
       if (taskId) {
@@ -140,19 +161,24 @@ function applyEvent(previousState, event) {
       if (taskId && status && EXECUTION_STATUSES.includes(status)) {
         const task = ensureTask(state, taskId);
         task.status = status;
-        if (status === 'blocked' && notes) {
+        if (status === 'blocked') {
+          state.blockers = (state.blockers || []).filter((b) => b.taskId !== taskId);
           state.blockers.push({
             taskId,
-            description: notes,
+            description: notes || 'Blocked',
             raisedAt: timestamp,
           });
+        } else {
+          // Unblocked: remove this task from the project blocker list
+          state.blockers = (state.blockers || []).filter((b) => b.taskId !== taskId);
         }
       }
       break;
     }
 
     case 'decision': {
-      const { decisionType, reason } = payload || {};
+      const { decisionType, reason, riskLevel, riskReason, summary, suggestProjectCompleted } =
+        payload || {};
       if (decisionType === 'kill_project' || decisionType === 'kill') {
         state.status = 'killed';
         // Revert all human resources: clear assignees from every task so people are released
@@ -164,6 +190,23 @@ function applyEvent(previousState, event) {
         }
       } else if (decisionType === 'complete' || decisionType === 'completed') {
         state.status = 'completed';
+      } else if (decisionType === 'project_assessment') {
+        if (riskLevel && RISK_LEVELS.includes(riskLevel)) {
+          state.risk.level = riskLevel;
+        }
+        const line = riskReason || summary || event.rationale;
+        if (line && state.risk.reasons) {
+          state.risk.reasons.push(line);
+        }
+        if (suggestProjectCompleted) {
+          const tasks = state.progress?.tasks || [];
+          const allDone =
+            tasks.length > 0 && tasks.every((t) => t.status === 'done');
+          const noBlockers = !(state.blockers || []).length;
+          if (allDone && noBlockers) {
+            state.status = 'completed';
+          }
+        }
       }
       if (reason && state.risk.reasons) {
         state.risk.reasons.push(reason);
@@ -172,14 +215,16 @@ function applyEvent(previousState, event) {
     }
 
     case 'need': {
-      const { kind, description, taskId, status } = payload || {};
+      const { kind, description, taskId, status, title } = payload || {};
       if (kind && description) {
+        const resolvedStatus = status || 'open';
         const need = {
           id: eventId,
           kind,
+          title: title || kind,
           description,
           taskId: taskId || null,
-          status: status === 'met' || status === 'cancelled' ? status : 'open',
+          status: resolvedStatus,
           source: event.source,
           createdAt: timestamp,
         };

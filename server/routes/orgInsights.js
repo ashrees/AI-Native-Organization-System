@@ -189,5 +189,11 @@ router.get('/', async (req, res) => {
   res.json({ metrics, insights: filteredInsights, insightsGeneratedAt: latestInsightsAt });
 });
 
+function getLatestInsights() {
+  return latestInsights;
+}
+
+router.getLatestInsights = getLatestInsights;
+
 module.exports = router;
 

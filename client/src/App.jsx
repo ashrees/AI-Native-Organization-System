@@ -7,8 +7,11 @@
  */
 
 import { useState, useEffect, useCallback } from 'react';
+import HelpChat from './HelpChat';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
+const WORKER_PORTAL_URL =
+  import.meta.env.VITE_WORKER_PORTAL_URL || 'http://localhost:5174';
 const THEME_STORAGE_KEY = 'leadership-view-theme';
 
 function getStoredTheme() {
@@ -27,10 +30,11 @@ function applyTheme(theme) {
 
 applyTheme(getStoredTheme());
 
-async function fetchJson(path) {
-  const res = await fetch(`${API_BASE}${path}`);
-  if (!res.ok) throw new Error(res.statusText);
-  return res.json();
+async function fetchJson(path, options) {
+  const res = await fetch(`${API_BASE}${path}`, options);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
 }
 
 function randomUUID() {
@@ -83,8 +87,19 @@ export default function App() {
         byProject[pid].push(e);
       }
       for (const pid of Object.keys(byProject)) {
-        byProject[pid].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-        byProject[pid] = byProject[pid].slice(0, 10);
+        byProject[pid].sort((a, b) => {
+          const priority = (e) => {
+            if (e.type === 'unassignment' || e.payload?.decisionType === 'member_on_leave') return 0;
+            if (e.payload?.decisionType === 'project_assessment') return 1;
+            if (e.type === 'decision') return 2;
+            return 3;
+          };
+          const pa = priority(a);
+          const pb = priority(b);
+          if (pa !== pb) return pa - pb;
+          return new Date(b.timestamp) - new Date(a.timestamp);
+        });
+        byProject[pid] = byProject[pid].slice(0, 12);
       }
       setEventsByProject(byProject);
     } catch (err) {
@@ -163,6 +178,8 @@ export default function App() {
   const [llmProjectId, setLlmProjectId] = useState('');
   const [llmLogs, setLlmLogs] = useState([]);
   const [llmLoading, setLlmLoading] = useState(false);
+  const [needs, setNeeds] = useState([]);
+  const [needsLoading, setNeedsLoading] = useState(false);
 
   // Load events + agent activity for Log tab when project is selected (orchestrator, team_builder, scheduler, project_ai, org_ai)
   useEffect(() => {
@@ -181,8 +198,10 @@ export default function App() {
     Promise.all([eventsPromise, activityPromise])
       .then(([eventsData, activityData]) => {
         if (cancelled) return;
-        const events = (eventsData.events || []).filter((e) =>
-          ['orchestrator', 'team_builder', 'scheduler', 'project_ai'].includes(e.source)
+        const events = (eventsData.events || []).filter(
+          (e) =>
+            ['orchestrator', 'team_builder', 'scheduler', 'project_ai'].includes(e.source) ||
+            (e.type === 'decision' && e.payload?.decisionType === 'project_assessment')
         );
         const activity = (activityData.agentActivity || []).map((a) => ({
           id: a.id,
@@ -233,6 +252,28 @@ export default function App() {
     };
   }, [activeTab, llmProjectId]);
 
+  useEffect(() => {
+    if (activeTab !== 'needs') {
+      setNeeds([]);
+      return;
+    }
+    let cancelled = false;
+    setNeedsLoading(true);
+    fetchJson('/events/needs')
+      .then((data) => {
+        if (!cancelled) setNeeds(data.needs || []);
+      })
+      .catch(() => {
+        if (!cancelled) setNeeds([]);
+      })
+      .finally(() => {
+        if (!cancelled) setNeedsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
   if (loading) return <div className="loading">Loading…</div>;
   if (error) return <div className="error">Error: {error}</div>;
 
@@ -244,24 +285,35 @@ export default function App() {
 
   return (
     <div className="app">
+      <HelpChat projects={projects} />
       <header className="app-header">
         <div className="app-header-top">
           <div className="app-header-brand">
             <h1>Leadership View</h1>
             <p className="subtitle">What is happening, why, and what changed recently.</p>
           </div>
-          <button
-            type="button"
-            className="theme-toggle"
-            onClick={toggleTheme}
-            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-            title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
-          >
-            <span className="theme-toggle-icon" aria-hidden="true">
-              {theme === 'dark' ? '☀' : '☾'}
-            </span>
-            {theme === 'dark' ? 'Light' : 'Dark'}
-          </button>
+          <div className="app-header-actions">
+            <a
+              href={WORKER_PORTAL_URL}
+              className="portal-link"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Worker Portal
+            </a>
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+            >
+              <span className="theme-toggle-icon" aria-hidden="true">
+                {theme === 'dark' ? '☀' : '☾'}
+              </span>
+              {theme === 'dark' ? 'Light' : 'Dark'}
+            </button>
+          </div>
         </div>
         <nav className="app-nav" aria-label="Main">
           <button
@@ -301,6 +353,13 @@ export default function App() {
             onClick={() => setActiveTab('llm')}
           >
             LLM Logs
+          </button>
+          <button
+            type="button"
+            className={`nav-tab ${activeTab === 'needs' ? 'active' : ''}`}
+            onClick={() => setActiveTab('needs')}
+          >
+            Worker requests
           </button>
         </nav>
       </header>
@@ -403,6 +462,148 @@ export default function App() {
             )}
             {!logProjectId && activeTab === 'log' && (
               <p className="empty">Select a project above to see AI agent logs (orchestrator, team_builder, scheduler, project_ai, org_ai).</p>
+            )}
+          </section>
+        )}
+
+        {activeTab === 'needs' && (
+          <section className="app-section" aria-labelledby="section-needs">
+            <h2 id="section-needs" className="section-title">Worker requests</h2>
+            <p className="section-desc">
+              All worker requests with routing and review status. Project leads and HR manage in the Worker Portal;
+              leadership can approve, reject, or close here (review tasks auto-complete).
+            </p>
+            {needsLoading ? (
+              <p className="empty">Loading…</p>
+            ) : needs.length === 0 ? (
+              <p className="empty">No worker requests yet.</p>
+            ) : (
+              <ul className="log-list needs-list">
+                {needs.map((n) => (
+                  <li key={n.id} className="log-entry needs-item">
+                    <div className="needs-item-header">
+                      <span className={`needs-status needs-status--${n.status}`}>{n.status}</span>
+                      <strong>{n.title || n.kind}</strong>
+                      <span className="needs-kind">{n.kind}</span>
+                    </div>
+                    <span className="log-meta">
+                      {n.submitterName && <>From {n.submitterName} · </>}
+                      {n.projectId} — {new Date(n.createdAt).toLocaleString()}
+                    </span>
+                    {n.forwardsTo && (
+                      <p className="needs-routing">Routes to: {n.forwardsTo}</p>
+                    )}
+                    {n.roleAssignments?.length > 0 && (
+                      <p className="needs-routing">
+                        Review tasks:{' '}
+                        {n.roleAssignments.map((a) => `${a.roleLabel || 'review'} → ${a.assigneeName || a.assigneeId}`).join('; ')}
+                      </p>
+                    )}
+                    <span className="log-message">{n.description}</span>
+                    {n.reviewedByName && (
+                      <p className="needs-review-notes">
+                        {n.status} by {n.reviewedByName}
+                        {n.reviewNotes ? ` — ${n.reviewNotes}` : ''}
+                      </p>
+                    )}
+                    {n.effectsApplied?.taskCount > 0 && (
+                      <p className="needs-routing">
+                        Applied: unassigned from {n.effectsApplied.taskCount} task(s)
+                        {n.effectsApplied.projectsCleared?.length
+                          ? ` (${n.effectsApplied.projectsCleared.join(', ')})`
+                          : ''}
+                      </p>
+                    )}
+                    {['open', 'in_review'].includes(n.status) && (
+                      <div className="needs-actions">
+                        <button
+                          type="button"
+                          className="nav-tab"
+                          style={{ marginBottom: 0 }}
+                          onClick={async () => {
+                            try {
+                              await fetchJson(`/events/needs/${n.id}`, {
+                                method: 'PATCH',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'in_review', reviewedBy: 'leadership' }),
+                              });
+                              const data = await fetchJson('/events/needs');
+                              setNeeds(data.needs || []);
+                            } catch (e) {
+                              onError(e.message);
+                            }
+                          }}
+                        >
+                          In review
+                        </button>
+                        <button
+                          type="button"
+                          className="nav-tab"
+                          style={{ marginBottom: 0 }}
+                          onClick={async () => {
+                            try {
+                              await fetchJson(`/events/needs/${n.id}`, {
+                                method: 'PATCH',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'approved', reviewedBy: 'leadership' }),
+                              });
+                              const data = await fetchJson('/events/needs');
+                              setNeeds(data.needs || []);
+                              load();
+                            } catch (e) {
+                              onError(e.message);
+                            }
+                          }}
+                        >
+                          Approve
+                        </button>
+                        <button
+                          type="button"
+                          className="nav-tab"
+                          style={{ marginBottom: 0 }}
+                          onClick={async () => {
+                            try {
+                              await fetchJson(`/events/needs/${n.id}`, {
+                                method: 'PATCH',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'rejected', reviewedBy: 'leadership' }),
+                              });
+                              const data = await fetchJson('/events/needs');
+                              setNeeds(data.needs || []);
+                              load();
+                            } catch (e) {
+                              onError(e.message);
+                            }
+                          }}
+                        >
+                          Reject
+                        </button>
+                        <button
+                          type="button"
+                          className="nav-tab"
+                          style={{ marginBottom: 0 }}
+                          onClick={async () => {
+                            try {
+                              await fetchJson(`/events/needs/${n.id}`, {
+                                method: 'PATCH',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ status: 'met', reviewedBy: 'leadership' }),
+                              });
+                              const data = await fetchJson('/events/needs');
+                              setNeeds(data.needs || []);
+                              load();
+                            } catch (e) {
+                              onError(e.message);
+                            }
+                          }}
+                        >
+                          Close
+                        </button>
+                      </div>
+                    )}
+                  </li>
+                ))}
+              </ul>
             )}
           </section>
         )}
@@ -636,7 +837,10 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
   return (
     <section className="submit-event action-card">
       <h3>Submit event</h3>
-      <p className="submit-event-desc">Execution: update task status. Decision: human judgment (reprioritize or kill project).</p>
+      <p className="submit-event-desc">
+        Execution: update task status. To clear a blocker, set the task to In progress or Done (not Blocked).
+        Decision: human judgment (reprioritize or kill project).
+      </p>
       <form onSubmit={handleSubmit}>
         <label>
           Event type
@@ -745,13 +949,21 @@ function ProjectCard({ project, recentEvents }) {
                 <span className="task-title">{t.title || t.id}</span>
                 {t.status && <span className="task-status"> [{t.status}]</span>}
               </div>
-              {t.assignee && (
+              {t.assigneeNote && (
+                <div className="task-assignee task-assignee--leave">
+                  {t.assigneeNote}
+                </div>
+              )}
+              {t.assignee && !t.assigneeNote && (
                 <div className="task-assignee">
                   Assignee: <strong>{t.assignee.name || t.assignee.id}</strong>
                   {t.assignee.team && ` — ${t.assignee.team}`}
                   {t.assignee.department && ` (${t.assignee.department})`}
                   {t.assignee.role && ` · ${t.assignee.role}`}
                 </div>
+              )}
+              {!t.assignee && !t.assigneeNote && t.assigneeId && (
+                <div className="task-assignee task-assignee--muted">Unassigned</div>
               )}
               {t.scheduledStart && (
                 <div className="task-schedule">

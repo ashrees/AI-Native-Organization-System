@@ -1,0 +1,1047 @@
+/**
+ * Human Worker Portal — standalone app (worker/).
+ * Login by name, view assignments, update status, submit HR/ops requests.
+ */
+
+import { useState, useEffect, useCallback } from 'react';
+import { fetchJson } from './api';
+
+const SESSION_KEY = 'worker-portal-person-id';
+const THEME_KEY = 'worker-portal-theme';
+const LEADERSHIP_URL =
+  import.meta.env.VITE_LEADERSHIP_URL || 'http://localhost:5173';
+
+const API_WORKER = '/worker';
+
+function getStoredTheme() {
+  try {
+    const t = localStorage.getItem(THEME_KEY);
+    if (t === 'light' || t === 'dark') return t;
+  } catch {
+    /* ignore */
+  }
+  return 'dark';
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+}
+
+applyTheme(getStoredTheme());
+
+function formatDate(iso) {
+  if (!iso) return '—';
+  try {
+    return new Date(iso).toLocaleString();
+  } catch {
+    return iso;
+  }
+}
+
+function statusLabel(s) {
+  if (!s || s === 'pending') return 'Pending';
+  return s.replace(/_/g, ' ');
+}
+
+function filterPeopleLocally(allPeople, query) {
+  const q = query.trim().toLowerCase();
+  if (!q) return allPeople;
+  const terms = q.split(/\s+/).filter(Boolean);
+  return allPeople.filter((p) => {
+    const hay = `${p.name} ${p.department} ${p.team} ${p.role} ${p.id}`.toLowerCase();
+    return terms.every((term) => hay.includes(term));
+  });
+}
+
+function LoginScreen({ onLogin }) {
+  const [query, setQuery] = useState('');
+  const [allPeople, setAllPeople] = useState([]);
+  const [people, setPeople] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    fetchJson(`${API_WORKER}/people`)
+      .then((data) => {
+        if (cancelled) return;
+        const list = data.people || [];
+        setAllPeople(list);
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setAllPeople([]);
+        const msg =
+          err.message === 'Not Found'
+            ? 'Worker API is unavailable. Restart the API server from the project root: npm start'
+            : err.message;
+        setError(msg);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (error) {
+      setPeople([]);
+      return;
+    }
+    setPeople(filterPeopleLocally(allPeople, query));
+  }, [query, allPeople, error]);
+
+  return (
+    <div className="worker-login">
+      <div className="worker-login-card">
+        <h1>Worker Portal</h1>
+        <p className="worker-login-desc">
+          Sign in with your name to view assignments, update task status, and submit requests.
+        </p>
+        <label className="worker-label">
+          Your name
+          <input
+            type="search"
+            value={query}
+            onChange={(e) => {
+              setQuery(e.target.value);
+              setError(null);
+            }}
+            placeholder="Search your name…"
+            autoComplete="name"
+            autoFocus
+          />
+        </label>
+        {error && <p className="worker-error">{error}</p>}
+        {loading && <p className="worker-muted">Loading team directory…</p>}
+        {!loading && !error && allPeople.length > 0 && !query.trim() && (
+          <p className="worker-muted">Select your name below ({allPeople.length} people in directory).</p>
+        )}
+        <ul className="worker-people-list">
+          {people.map((p) => (
+            <li key={p.id}>
+              <button type="button" className="worker-person-btn" onClick={() => onLogin(p)}>
+                <span className="worker-person-name">{p.name}</span>
+                <span className="worker-person-meta">
+                  {p.role} · {p.department} / {p.team}
+                </span>
+                <span className="worker-person-load">Load: {p.currentLoad}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+        {!loading && !error && query.trim() && people.length === 0 && (
+          <p className="worker-muted">No matching people for “{query.trim()}”. Try first name only.</p>
+        )}
+        <a className="worker-external-link" href={LEADERSHIP_URL}>
+          Leadership View →
+        </a>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, tone }) {
+  return (
+    <div className={`worker-stat worker-stat--${tone || 'default'}`}>
+      <span className="worker-stat-value">{value}</span>
+      <span className="worker-stat-label">{label}</span>
+    </div>
+  );
+}
+
+function TaskCard({ task, personId, onUpdated }) {
+  const [status, setStatus] = useState(task.status || 'pending');
+  const [notes, setNotes] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  async function submitStatus(nextStatus) {
+    setSaving(true);
+    setMsg(null);
+    try {
+      await fetchJson(`${API_WORKER}/status`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectId: task.projectId,
+          taskId: task.id,
+          personId,
+          status: nextStatus,
+          notes: notes.trim() || undefined,
+        }),
+      });
+      setStatus(nextStatus);
+      setMsg('Saved');
+      onUpdated();
+    } catch (err) {
+      setMsg(err.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <article className={`worker-task worker-task--${status || 'pending'}`}>
+      <header className="worker-task-head">
+        <h3>{task.title}</h3>
+        <span className={`worker-pill worker-pill--${task.projectStatus}`}>{task.projectStatus}</span>
+      </header>
+      <p className="worker-task-project">{task.projectTitle}</p>
+      {task.description && <p className="worker-task-desc">{task.description}</p>}
+      {(task.scheduledStart || task.scheduledEnd) && (
+        <p className="worker-task-schedule">
+          Schedule: {formatDate(task.scheduledStart)} — {formatDate(task.scheduledEnd)}
+        </p>
+      )}
+      <p className="worker-task-current">
+        Status: <strong>{statusLabel(status)}</strong>
+      </p>
+      <label className="worker-label worker-label--inline">
+        Notes (optional)
+        <input
+          type="text"
+          value={notes}
+          onChange={(e) => setNotes(e.target.value)}
+          placeholder={status === 'blocked' ? 'What is blocking you?' : 'Update notes'}
+        />
+      </label>
+      <div className="worker-task-actions">
+        <button type="button" disabled={saving} onClick={() => submitStatus('in_progress')}>
+          In progress
+        </button>
+        <button type="button" disabled={saving} onClick={() => submitStatus('done')}>
+          Done
+        </button>
+        <button type="button" className="worker-btn-warn" disabled={saving} onClick={() => submitStatus('blocked')}>
+          Blocked
+        </button>
+      </div>
+      {msg && <p className={msg === 'Saved' ? 'worker-ok' : 'worker-error'}>{msg}</p>}
+    </article>
+  );
+}
+
+const HANDLING_LABELS = { ai: 'AI agents', notify: 'Notify teams', self: 'Self-manage' };
+
+function RequestForm({ dashboard, personId, onSubmitted }) {
+  const [kind, setKind] = useState('general');
+  const [handlingMode, setHandlingMode] = useState('notify');
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [projectId, setProjectId] = useState('org-general');
+  const [taskId, setTaskId] = useState('');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const [status, setStatus] = useState(null);
+
+  const kinds = dashboard.requestKinds || [];
+  const modes = dashboard.handlingModes || [];
+  const selectedKind = kinds.find((k) => k.id === kind);
+  const projectOptions = [
+    { id: 'org-general', title: 'General / HR (no specific project)' },
+    ...(dashboard.projects || []).map((p) => ({ id: p.id, title: p.title })),
+  ];
+  const tasksForProject = (dashboard.tasks || []).filter((t) => t.projectId === projectId);
+
+  async function handleSubmit(e) {
+    e.preventDefault();
+    setStatus(null);
+    try {
+      await fetchJson(`${API_WORKER}/requests`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personId,
+          kind,
+          handlingMode,
+          title,
+          description,
+          projectId: projectId === 'org-general' ? undefined : projectId,
+          taskId: taskId || undefined,
+          startDate: startDate || undefined,
+          endDate: endDate || undefined,
+        }),
+      });
+      setTitle('');
+      setDescription('');
+      setStartDate('');
+      setEndDate('');
+      setTaskId('');
+      setStatus('ok');
+      onSubmitted();
+    } catch (err) {
+      setStatus(err.message);
+    }
+  }
+
+  return (
+    <form className="worker-request-form" onSubmit={handleSubmit}>
+      <h3>New request</h3>
+      <p className="worker-muted">Sick leave, transfers, workload, schedule changes, and more.</p>
+      <fieldset className="worker-handling-modes">
+        <legend className="worker-label">How should this be handled?</legend>
+        {modes.map((m) => (
+          <label key={m.id} className="worker-radio">
+            <input
+              type="radio"
+              name="handlingMode"
+              value={m.id}
+              checked={handlingMode === m.id}
+              onChange={() => setHandlingMode(m.id)}
+            />
+            <span>
+              <strong>{m.label}</strong>
+              <span className="worker-muted"> — {m.description}</span>
+            </span>
+          </label>
+        ))}
+      </fieldset>
+      <label className="worker-label">
+        Request type
+        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          {kinds.map((k) => (
+            <option key={k.id} value={k.id}>
+              {k.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {selectedKind?.forwardsTo && (
+        <p className="worker-routing-hint">
+          Forwards to: <strong>{selectedKind.forwardsTo}</strong>
+          {selectedKind.aiAgent && (
+            <span className="worker-muted"> · coordinated by {selectedKind.aiAgent}</span>
+          )}
+        </p>
+      )}
+      <label className="worker-label">
+        Title
+        <input value={title} onChange={(e) => setTitle(e.target.value)} required placeholder="Short summary" />
+      </label>
+      <label className="worker-label">
+        Details
+        <textarea
+          value={description}
+          onChange={(e) => setDescription(e.target.value)}
+          rows={3}
+          placeholder="Describe your request…"
+        />
+      </label>
+      <label className="worker-label">
+        Related project
+        <select value={projectId} onChange={(e) => { setProjectId(e.target.value); setTaskId(''); }}>
+          {projectOptions.map((p) => (
+            <option key={p.id} value={p.id}>{p.title}</option>
+          ))}
+        </select>
+      </label>
+      {tasksForProject.length > 0 && (
+        <label className="worker-label">
+          Related task (optional)
+          <select value={taskId} onChange={(e) => setTaskId(e.target.value)}>
+            <option value="">— None —</option>
+            {tasksForProject.map((t) => (
+              <option key={t.id} value={t.id}>{t.title}</option>
+            ))}
+          </select>
+        </label>
+      )}
+      <div className="worker-date-row">
+        <label className="worker-label">
+          Start date
+          <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </label>
+        <label className="worker-label">
+          End date
+          <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+        </label>
+      </div>
+      <button type="submit" className="worker-btn-primary">Submit request</button>
+      {status === 'ok' && (
+        <p className="worker-ok">
+          Request submitted ({HANDLING_LABELS[handlingMode] || handlingMode}). Routed to:{' '}
+          {selectedKind?.forwardsTo || 'mapped roles'}.
+        </p>
+      )}
+      {status && status !== 'ok' && <p className="worker-error">{status}</p>}
+    </form>
+  );
+}
+
+function RequestRow({ r }) {
+  return (
+    <li>
+      <span className={`worker-pill worker-pill--req-${r.status || 'open'}`}>{r.status || 'open'}</span>
+      <strong>{r.title}</strong>
+      <span className="worker-req-kind">{r.kind}</span>
+      <span className="worker-req-kind"> · {HANDLING_LABELS[r.handlingMode] || r.handlingMode}</span>
+      {(r.forwardsTo || r.routingLabel) && (
+        <span className="worker-muted"> → {r.forwardsTo || r.routingLabel}</span>
+      )}
+      {r.aiAgent && <span className="worker-muted"> · {r.aiAgent}</span>}
+      <p>{r.description}</p>
+      {(r.forwardTargets?.length || r.notifyTargets?.length) > 0 && (
+        <p className="worker-muted">
+          Forwarded to: {(r.forwardTargets || r.notifyTargets).map((t) =>
+            t.roleLabel ? `${t.name} (${t.roleLabel})` : t.name
+          ).join(', ')}
+        </p>
+      )}
+      {r.roleAssignments?.length > 0 && (
+        <p className="worker-muted">
+          AI tasks: {r.roleAssignments.map((a) => `${a.roleLabel || 'review'} → ${a.assigneeName || a.assigneeId}`).join('; ')}
+        </p>
+      )}
+      {r.reviewedByName && ['approved', 'rejected', 'met'].includes(r.status) && (
+        <p className="worker-ok">
+          {r.status} by {r.reviewedByName}
+          {r.reviewNotes ? ` — ${r.reviewNotes}` : ''}
+        </p>
+      )}
+      {r.effectsApplied?.taskCount > 0 && (
+        <p className="worker-muted">
+          System updated: removed from {r.effectsApplied.taskCount} task(s)
+          {r.effectsApplied.projectsCleared?.length
+            ? ` on ${r.effectsApplied.projectsCleared.join(', ')}`
+            : ''}
+        </p>
+      )}
+      {r.reviewNotes && !r.reviewedByName && <p className="worker-ok">Notes: {r.reviewNotes}</p>}
+      <span className="worker-muted">{formatDate(r.timestamp)} · {r.projectId}</span>
+    </li>
+  );
+}
+
+function RequestReviewActions({ requestId, personId, notes, setNotes, onDone, msg, setMsg }) {
+  async function review(status) {
+    setMsg(null);
+    try {
+      await fetchJson(`${API_WORKER}/requests/${requestId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status,
+          reviewerPersonId: personId,
+          reviewNotes: notes[requestId] || undefined,
+        }),
+      });
+      onDone();
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  return (
+    <>
+      {msg && <p className="worker-error">{msg}</p>}
+      <label className="worker-label">
+        Review notes
+        <input
+          value={notes[requestId] || ''}
+          onChange={(e) => setNotes((n) => ({ ...n, [requestId]: e.target.value }))}
+          placeholder="Decision or next steps for the employee"
+        />
+      </label>
+      <div className="worker-task-actions">
+        <button type="button" onClick={() => review('in_review')}>Mark in review</button>
+        <button type="button" onClick={() => review('approved')}>Approve</button>
+        <button type="button" className="worker-btn-warn" onClick={() => review('rejected')}>
+          Reject
+        </button>
+        <button type="button" onClick={() => review('met')}>Close (resolved)</button>
+      </div>
+    </>
+  );
+}
+
+function ProjectReviewInbox({ personId, onUpdated }) {
+  const [inbox, setInbox] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [notes, setNotes] = useState({});
+  const [msg, setMsg] = useState(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetchJson(`${API_WORKER}/project/inbox?personId=${encodeURIComponent(personId)}`)
+      .then((d) => setInbox(d.inbox || []))
+      .catch(() => setInbox([]))
+      .finally(() => setLoading(false));
+  }, [personId]);
+
+  useEffect(() => {
+    load();
+  }, [load, onUpdated]);
+
+  if (loading) return <p className="worker-muted">Loading project reviews…</p>;
+
+  return (
+    <section>
+      <h2>Project reviews</h2>
+      <p className="worker-muted">
+        Manage workload, contribution, and blocker requests assigned to you. Approve or reject to close review tasks.
+      </p>
+      <ul className="worker-request-list">
+        {inbox.map((r) => (
+          <li key={r.id} className="worker-hr-item">
+            <RequestRow r={r} />
+            <p className="worker-muted">From: {r.submitterName || r.submitterId}</p>
+            <RequestReviewActions
+              requestId={r.id}
+              personId={personId}
+              notes={notes}
+              setNotes={setNotes}
+              onDone={() => {
+                load();
+                onUpdated();
+              }}
+              msg={msg}
+              setMsg={setMsg}
+            />
+          </li>
+        ))}
+      </ul>
+      {inbox.length === 0 && (
+        <p className="worker-muted">No project-scoped requests assigned to you right now.</p>
+      )}
+    </section>
+  );
+}
+
+function HrEmergencyPanel({ personId, onUpdated }) {
+  const [onLeave, setOnLeave] = useState([]);
+  const [reason, setReason] = useState({});
+  const [projectId, setProjectId] = useState({});
+  const [taskId, setTaskId] = useState({});
+  const [msg, setMsg] = useState(null);
+
+  useEffect(() => {
+    fetchJson(`${API_WORKER}/hr/on-leave?personId=${encodeURIComponent(personId)}`)
+      .then((d) => setOnLeave(d.people || []))
+      .catch(() => setOnLeave([]));
+  }, [personId, onUpdated]);
+
+  async function activate(targetId) {
+    setMsg(null);
+    try {
+      await fetchJson(`${API_WORKER}/hr/emergency-activate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hrPersonId: personId,
+          targetPersonId: targetId,
+          reason: reason[targetId] || 'Emergency operational need',
+          projectId: projectId[targetId] || undefined,
+          taskId: taskId[targetId] || undefined,
+        }),
+      });
+      onUpdated();
+      const d = await fetchJson(`${API_WORKER}/hr/on-leave?personId=${encodeURIComponent(personId)}`);
+      setOnLeave(d.people || []);
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  async function endEmergency(targetId, returnTo) {
+    setMsg(null);
+    try {
+      await fetchJson(`${API_WORKER}/hr/emergency-end`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          hrPersonId: personId,
+          targetPersonId: targetId,
+          returnTo,
+          reason: reason[targetId] || undefined,
+        }),
+      });
+      onUpdated();
+      const d = await fetchJson(`${API_WORKER}/hr/on-leave?personId=${encodeURIComponent(personId)}`);
+      setOnLeave(d.people || []);
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  const needsAction = onLeave.filter((p) => p.availabilityStatus === 'on_leave');
+  const inEmergency = onLeave.filter((p) => p.availabilityStatus === 'emergency_active');
+  if (needsAction.length === 0 && inEmergency.length === 0) return null;
+
+  return (
+    <div className="worker-hr-emergency">
+      <h3>Emergency return to work</h3>
+      <p className="worker-muted">
+        Authorize someone on sick leave or PTO to work temporarily. Original leave stays on record until you end emergency or close leave.
+      </p>
+      {msg && <p className="worker-error">{msg}</p>}
+      {needsAction.map((p) => (
+        <div key={p.id} className="worker-hr-emergency-card">
+          <strong>{p.name}</strong>
+          <span className="worker-muted"> — on leave ({p.availabilityReason || 'leave'})</span>
+          <label className="worker-label">
+            Reason
+            <input
+              value={reason[p.id] || ''}
+              onChange={(e) => setReason((r) => ({ ...r, [p.id]: e.target.value }))}
+              placeholder="e.g. Production outage needs database lead"
+            />
+          </label>
+          <label className="worker-label">
+            Project id (optional)
+            <input
+              value={projectId[p.id] || ''}
+              onChange={(e) => setProjectId((r) => ({ ...r, [p.id]: e.target.value }))}
+              placeholder="proj-native-app"
+            />
+          </label>
+          <label className="worker-label">
+            Task id (optional)
+            <input
+              value={taskId[p.id] || ''}
+              onChange={(e) => setTaskId((r) => ({ ...r, [p.id]: e.target.value }))}
+              placeholder="task-12"
+            />
+          </label>
+          <button type="button" className="worker-btn-primary" onClick={() => activate(p.id)}>
+            Authorize emergency work
+          </button>
+        </div>
+      ))}
+      {inEmergency.map((p) => (
+        <div key={p.id} className="worker-hr-emergency-card worker-hr-emergency-card--active">
+          <strong>{p.name}</strong>
+          <span className="worker-muted"> — emergency work active</span>
+          <div className="worker-task-actions">
+            <button type="button" onClick={() => endEmergency(p.id, 'leave')}>
+              End emergency → back on leave
+            </button>
+            <button type="button" onClick={() => endEmergency(p.id, 'active')}>
+              End emergency → fully returned
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function HrInbox({ personId, onUpdated }) {
+  const [inbox, setInbox] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [notes, setNotes] = useState({});
+  const [taskTitle, setTaskTitle] = useState({});
+  const [msg, setMsg] = useState(null);
+
+  const load = useCallback(() => {
+    setLoading(true);
+    fetchJson(`${API_WORKER}/hr/inbox?personId=${encodeURIComponent(personId)}`)
+      .then(setInbox)
+      .catch((e) => setMsg(e.message))
+      .finally(() => setLoading(false));
+  }, [personId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function review(requestId, status) {
+    setMsg(null);
+    try {
+      await fetchJson(`${API_WORKER}/requests/${requestId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          status,
+          reviewerPersonId: personId,
+          reviewNotes: notes[requestId] || undefined,
+        }),
+      });
+      load();
+      onUpdated();
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  async function createTask(requestId) {
+    const title = taskTitle[requestId];
+    if (!title?.trim()) return;
+    try {
+      await fetchJson(`${API_WORKER}/requests/${requestId}/tasks`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          reviewerPersonId: personId,
+          taskTitle: title.trim(),
+        }),
+      });
+      setTaskTitle((t) => ({ ...t, [requestId]: '' }));
+      load();
+      onUpdated();
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  if (loading) return <p className="worker-muted">Loading HR inbox…</p>;
+  if (!inbox) return <p className="worker-error">{msg || 'Unable to load inbox'}</p>;
+
+  return (
+    <section>
+      <h2>HR inbox</h2>
+      <p className="worker-muted">
+        HR-only queue: leave, PTO, transfers, and org-wide items — not project workload or stopping contribution on a project.
+      </p>
+      {msg && <p className="worker-error">{msg}</p>}
+      <ul className="worker-request-list">
+        {inbox.inbox.map((r) => (
+          <li key={r.id} className="worker-hr-item">
+            <RequestRow r={r} />
+            <p className="worker-muted">From: {r.submitterName || r.submitterId}</p>
+            <label className="worker-label">
+              Review notes
+              <input
+                value={notes[r.id] || ''}
+                onChange={(e) => setNotes((n) => ({ ...n, [r.id]: e.target.value }))}
+                placeholder="Optional message to employee"
+              />
+            </label>
+            <div className="worker-task-actions">
+              <button type="button" onClick={() => review(r.id, 'in_review')}>Mark in review</button>
+              <button type="button" onClick={() => review(r.id, 'approved')}>Approve</button>
+              <button type="button" className="worker-btn-warn" onClick={() => review(r.id, 'rejected')}>
+                Reject
+              </button>
+              <button type="button" onClick={() => review(r.id, 'met')}>Close (met)</button>
+            </div>
+            <label className="worker-label">
+              Issue HR task
+              <input
+                value={taskTitle[r.id] || ''}
+                onChange={(e) => setTaskTitle((t) => ({ ...t, [r.id]: e.target.value }))}
+                placeholder="e.g. Schedule return-to-work check-in"
+              />
+            </label>
+            <button type="button" className="worker-btn-primary" onClick={() => createTask(r.id)}>
+              Create task for me
+            </button>
+          </li>
+        ))}
+      </ul>
+      {inbox.inbox.length === 0 && <p className="worker-muted">No open worker requests.</p>}
+      <HrEmergencyPanel personId={personId} onUpdated={onUpdated} />
+      {inbox.hrTasks?.length > 0 && (
+        <>
+          <h3>Your HR review tasks</h3>
+          <ul className="worker-activity-list">
+            {inbox.hrTasks.map((t) => (
+              <li key={`${t.projectId}-${t.id}`}>
+                <strong>{t.title}</strong> — {t.projectTitle} [{t.status || 'pending'}]
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </section>
+  );
+}
+
+export default function App() {
+  const [personId, setPersonId] = useState(() => {
+    try {
+      return sessionStorage.getItem(SESSION_KEY) || '';
+    } catch {
+      return '';
+    }
+  });
+  const [dashboard, setDashboard] = useState(null);
+  const [loading, setLoading] = useState(!!personId);
+  const [error, setError] = useState(null);
+  const [tab, setTab] = useState('overview');
+  const [theme, setTheme] = useState(getStoredTheme);
+  const [taskFilter, setTaskFilter] = useState('all');
+
+  const loadDashboard = useCallback(async () => {
+    if (!personId) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await fetchJson(`${API_WORKER}/dashboard?personId=${encodeURIComponent(personId)}`);
+      setDashboard(data);
+    } catch (err) {
+      setError(err.message);
+      setDashboard(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [personId]);
+
+  useEffect(() => {
+    loadDashboard();
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    applyTheme(theme);
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      /* ignore */
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    if (!personId) return undefined;
+    const base = import.meta.env.VITE_API_URL || '/api';
+    const es = new EventSource(`${base}/events/stream`);
+    const refresh = () => loadDashboard();
+    es.addEventListener('event', refresh);
+    return () => es.close();
+  }, [personId, loadDashboard]);
+
+  function handleLogin(person) {
+    setPersonId(person.id);
+    try {
+      sessionStorage.setItem(SESSION_KEY, person.id);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function logout() {
+    setPersonId('');
+    setDashboard(null);
+    try {
+      sessionStorage.removeItem(SESSION_KEY);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  if (!personId) {
+    return <LoginScreen onLogin={handleLogin} />;
+  }
+
+  if (loading && !dashboard) {
+    return <div className="worker-loading">Loading your workspace…</div>;
+  }
+
+  if (error && !dashboard) {
+    return (
+      <div className="worker-error-page">
+        <p>{error}</p>
+        <button type="button" onClick={logout}>Sign out</button>
+      </div>
+    );
+  }
+
+  const p = dashboard.person;
+  const stats = dashboard.stats;
+  const filteredTasks =
+    taskFilter === 'all'
+      ? dashboard.tasks
+      : dashboard.tasks.filter((t) => (t.status || 'pending') === taskFilter);
+
+  return (
+    <div className="worker-app">
+      <header className="worker-header">
+        <div className="worker-header-main">
+          <div>
+            <h1>{p.name}</h1>
+            <p className="worker-role-line">
+              {p.role} · {p.department} / {p.team}
+            </p>
+            {p.availabilityStatus === 'on_leave' && (
+              <p className="worker-leave-banner">
+                On leave{p.availabilityUntil ? ` until ${formatDate(p.availabilityUntil)}` : ''}
+                {p.availabilityReason ? ` (${p.availabilityReason.replace(/_/g, ' ')})` : ''}
+                . Contact HR for emergency work authorization.
+              </p>
+            )}
+            {p.availabilityStatus === 'emergency_active' && (
+              <p className="worker-emergency-banner">
+                Emergency work authorized by HR — limited assignment while leave remains on record.
+              </p>
+            )}
+            {p.skills?.length > 0 && (
+              <p className="worker-skills">
+                {p.skills.slice(0, 6).join(' · ')}
+                {p.skills.length > 6 ? ' …' : ''}
+              </p>
+            )}
+          </div>
+          <div className="worker-header-actions">
+            <button type="button" className="worker-theme-btn" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
+              {theme === 'dark' ? '☀ Light' : '☾ Dark'}
+            </button>
+            <button type="button" className="worker-ghost-btn" onClick={loadDashboard}>
+              Refresh
+            </button>
+            <button type="button" className="worker-ghost-btn" onClick={logout}>
+              Sign out
+            </button>
+          </div>
+        </div>
+        <nav className="worker-nav" aria-label="Worker sections">
+          {[
+            'overview',
+            'tasks',
+            'projects',
+            'requests',
+            ...(dashboard.isHr ? ['hr'] : []),
+            'reviews',
+            'activity',
+          ].map((id) => (
+            <button
+              key={id}
+              type="button"
+              className={tab === id ? 'active' : ''}
+              onClick={() => setTab(id)}
+            >
+              {id.charAt(0).toUpperCase() + id.slice(1)}
+              {id === 'tasks' && stats.totalTasks > 0 && (
+                <span className="worker-nav-badge">{stats.totalTasks}</span>
+              )}
+              {id === 'hr' && stats.openHrInbox > 0 && (
+                <span className="worker-nav-badge">{stats.openHrInbox}</span>
+              )}
+            </button>
+          ))}
+        </nav>
+      </header>
+
+      <main className="worker-main">
+        {tab === 'overview' && (
+          <section>
+            <div className="worker-stats-row">
+              <StatCard label="Active tasks" value={stats.totalTasks - stats.done} tone="accent" />
+              <StatCard label="In progress" value={stats.inProgress} />
+              <StatCard label="Blocked" value={stats.blocked} tone="warn" />
+              <StatCard label="Done" value={stats.done} tone="ok" />
+              <StatCard label="Projects" value={stats.activeProjects} />
+              <StatCard label="Open requests" value={stats.openRequests} />
+            </div>
+            <p className="worker-muted worker-load-line">
+              Current load index: <strong>{stats.currentLoad}</strong> assigned open task(s)
+            </p>
+            {stats.blocked > 0 && (
+              <div className="worker-banner worker-banner--warn">
+                You have {stats.blocked} blocked task(s). Leadership may be notified for replanning.
+              </div>
+            )}
+            <h2>Up next</h2>
+            {dashboard.tasks.slice(0, 3).map((t) => (
+              <TaskCard key={`${t.projectId}-${t.id}`} task={t} personId={personId} onUpdated={loadDashboard} />
+            ))}
+            {dashboard.tasks.length === 0 && (
+              <p className="worker-muted">No assigned tasks yet. Check back after team assignment runs.</p>
+            )}
+          </section>
+        )}
+
+        {tab === 'tasks' && (
+          <section>
+            <div className="worker-filter-row">
+              {['all', 'in_progress', 'blocked', 'pending', 'done'].map((f) => (
+                <button
+                  key={f}
+                  type="button"
+                  className={taskFilter === f ? 'active' : ''}
+                  onClick={() => setTaskFilter(f)}
+                >
+                  {f === 'all' ? 'All' : statusLabel(f)}
+                </button>
+              ))}
+            </div>
+            <div className="worker-task-grid">
+              {filteredTasks.map((t) => (
+                <TaskCard key={`${t.projectId}-${t.id}`} task={t} personId={personId} onUpdated={loadDashboard} />
+              ))}
+            </div>
+            {filteredTasks.length === 0 && <p className="worker-muted">No tasks in this filter.</p>}
+          </section>
+        )}
+
+        {tab === 'projects' && (
+          <section className="worker-project-grid">
+            {dashboard.projects.map((proj) => (
+              <article key={proj.id} className="worker-project-card">
+                <h3>{proj.title}</h3>
+                <p className="worker-project-id">{proj.id}</p>
+                <span className={`worker-pill worker-pill--${proj.status}`}>{proj.status}</span>
+                <span className={`worker-pill worker-pill--risk-${proj.riskLevel}`}>Risk: {proj.riskLevel}</span>
+                <ul className="worker-project-stats">
+                  <li>{proj.taskCount} task(s) assigned to you</li>
+                  <li>{proj.tasksDone} done · {proj.tasksBlocked} blocked</li>
+                  <li>Updated {formatDate(proj.lastUpdatedAt)}</li>
+                </ul>
+                {proj.blockers?.length > 0 && (
+                  <div className="worker-blockers">
+                    <strong>Blockers</strong>
+                    <ul>
+                      {proj.blockers.map((b, i) => (
+                        <li key={i}>{b.description || b.taskId}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </article>
+            ))}
+            {dashboard.projects.length === 0 && (
+              <p className="worker-muted">You are not assigned to any projects yet.</p>
+            )}
+          </section>
+        )}
+
+        {tab === 'requests' && (
+          <section className="worker-requests-section">
+            <RequestForm dashboard={dashboard} personId={personId} onSubmitted={loadDashboard} />
+            <h2>Your requests</h2>
+            <ul className="worker-request-list">
+              {dashboard.requests.map((r) => (
+                <RequestRow key={r.id} r={r} />
+              ))}
+            </ul>
+            {dashboard.requests.length === 0 && (
+              <p className="worker-muted">No requests submitted yet.</p>
+            )}
+          </section>
+        )}
+
+        {tab === 'hr' && dashboard.isHr && (
+          <HrInbox personId={personId} onUpdated={loadDashboard} />
+        )}
+
+        {tab === 'reviews' && (
+          <ProjectReviewInbox personId={personId} onUpdated={loadDashboard} />
+        )}
+
+        {tab === 'activity' && (
+          <section>
+            <ul className="worker-activity-list">
+              {dashboard.recentActivity.map((a) => (
+                <li key={a.id}>
+                  <strong>{statusLabel(a.status)}</strong> on task {a.taskId}
+                  <span className="worker-muted"> · {a.projectId} · {formatDate(a.timestamp)}</span>
+                  {a.notes && <p>{a.notes}</p>}
+                </li>
+              ))}
+            </ul>
+            {dashboard.recentActivity.length === 0 && (
+              <p className="worker-muted">No recent status updates from you.</p>
+            )}
+          </section>
+        )}
+      </main>
+
+      <footer className="worker-footer">
+        <a href={LEADERSHIP_URL}>Leadership View</a>
+        <span>Worker Portal · separate deploy from client/</span>
+      </footer>
+    </div>
+  );
+}

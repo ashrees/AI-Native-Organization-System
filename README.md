@@ -10,12 +10,15 @@ An AI-first system that automates **corporate coordination**, not people. AI mai
 ## Table of contents
 
 - [Overview](#overview)
+- [Applications](#applications)
+- [Key features](#key-features)
 - [Requirements](#requirements)
 - [Quick start (local)](#quick-start-local)
 - [Environment variables](#environment-variables)
 - [Running the application](#running-the-application)
 - [Verify your setup](#verify-your-setup)
 - [Demo workflow](#demo-workflow)
+- [Worker requests & HR workflows](#worker-requests--hr-workflows)
 - [API reference](#api-reference)
 - [Project structure](#project-structure)
 - [Utility scripts](#utility-scripts)
@@ -34,21 +37,128 @@ Modern teams lose time to status meetings, fragmented tools, and manual triage. 
 3. **Team Builder AI** assigns people with rationale  
 4. **Scheduler AI** proposes timelines  
 5. **Humans execute** and emit events  
-6. **Project state** updates from events only  
-7. **Leadership View** shows what changed and why  
-8. **Replan** triggers on blockers or reprioritization  
+6. **Project AI** reevaluates risk after each human execution  
+7. **Project state** updates from events only  
+8. **Leadership View** shows what changed and why  
+9. **Replan** triggers on blockers or reprioritization  
 
-The **Leadership View** (React) is read-only for executives: projects, risk, blockers, org insights, agent logs, and LLM traces. Humans submit requests and execution/decision events via the UI or API.
+**Persistence:** PostgreSQL ([Neon](https://neon.tech) or any Postgres). **Real-time:** SSE pushes updates to both frontends.
 
 ### Tech stack
 
 | Layer | Technology |
 |--------|------------|
 | API | Node.js 18+, Express |
-| Persistence | PostgreSQL ([Neon](https://neon.tech) or any Postgres) via `pg` |
+| Persistence | PostgreSQL via `pg` |
 | AI | Google Gemini, OpenAI, or Ollama (optional; stubs without keys) |
-| Frontend | React 18, Vite 5 |
+| Leadership UI | React 18, Vite 5 (`client/`, port 5173) |
+| Worker UI | React 18, Vite 5 (`worker/`, port 5174) — separate deploy |
 | Real-time | Server-Sent Events (SSE) |
+
+---
+
+## Applications
+
+Three apps share one API; each can be hosted independently.
+
+| App | Path | Port (dev) | Audience |
+|-----|------|------------|----------|
+| **API server** | `server/` | 3000 | All clients |
+| **Leadership View** | `client/` | 5173 | Executives — overview, projects, actions, logs, help chat |
+| **Worker Portal** | `worker/` | 5174 | Individual contributors — tasks, status, HR/ops requests |
+
+Leadership View links to the Worker Portal via `VITE_WORKER_PORTAL_URL`. The Worker Portal links back via `VITE_LEADERSHIP_URL`.
+
+---
+
+## Key features
+
+### Leadership View (`client/`)
+
+- **Overview** — org metrics and AI-generated insights (background refresh)  
+- **Projects** — live state, tasks, assignees, blockers, risk, “What changed recently”  
+- **Actions** — submit work `request` events and human `execution` / `decision` events  
+- **Log** — orchestrator, team_builder, scheduler, project_ai activity  
+- **LLM Logs** — full prompts and responses per project  
+- **Worker requests** — all human `need` events; leadership can approve/reject/close  
+- **Help chat** (floating) — ask Org AI / Orchestrator / Project AI with live store context  
+- **Dark / light theme**, SSE live refresh  
+
+### Worker Portal (`worker/`)
+
+- **Login by name** — directory search (`GET /worker/people`)  
+- **Tasks** — update status (`in_progress`, `done`, `blocked`) on assigned work  
+- **Requests** — sick leave, vacation, workload, transfer, blockers, etc.  
+- **Handling modes** — AI agents (review tasks), notify teams, or self-manage  
+- **Routing preview** — each request type shows who it forwards to  
+- **HR inbox** (HR role) — approve/reject leave and HR-scoped requests  
+- **Project reviews** — project leads / engineering mgmt review workload & contribution requests  
+- **Emergency return** (HR) — authorize someone on leave to work temporarily  
+
+### Worker request routing
+
+Every request **kind** maps to specific **roles** and an **AI coordinating agent** (see `server/constants/requestRouting.js`):
+
+| Kind | Typical forwards to | AI agent |
+|------|---------------------|----------|
+| Sick leave, vacation, training | HR | `org_ai` |
+| Workload concern | Project lead + engineering mgmt | `orchestrator` |
+| Stop / change contribution | Project lead + one team rep | `project_ai` |
+| Blocker escalation | Project lead + team + engineering mgmt | `orchestrator` |
+| Project transfer | HR + project + engineering mgmt | `orchestrator` |
+| Equipment | DevOps + HR | `scheduler` |
+| General (on a project) | Project lead + team | `org_ai` |
+| Emergency return | HR only | `org_ai` |
+
+Project-scoped items (e.g. workload on `proj-native-app`) go to **Project reviews**, not the HR inbox.
+
+### Approval side effects (sick leave, transfer, etc.)
+
+When HR or leadership **approves** a worker request, the system updates more than status:
+
+- **Sick leave / vacation** — person marked `on_leave`; unassigned from all active project tasks (`unassignment` events); per-project **leave notice** in “What changed recently”; open review tasks for that employee cancelled  
+- **Transfer / stop contribution** — removed from target project (or all projects)  
+- **On leave** — cannot submit new requests until HR authorizes **emergency return**  
+- **Team Builder** — skips people on leave; includes people in `emergency_active`  
+- **Startup reconciliation** — approved requests missing effects are backfilled once on server start  
+
+### Emergency return to work
+
+While on approved leave, HR can temporarily authorize urgent work:
+
+1. Worker Portal → **HR** → **Emergency return to work**  
+2. Select person (e.g. Draco Malfoy), reason, optional project + task id  
+3. Status becomes `emergency_active` — leave stays on record  
+4. Optional immediate **assignment** to a task  
+5. When done: **End emergency → back on leave** or **→ fully returned**  
+
+API: `POST /worker/hr/emergency-activate`, `POST /worker/hr/emergency-end`.
+
+### Project AI after human execution
+
+Every **human** `execution` event (Worker Portal or Leadership Actions) triggers **Project AI** asynchronously:
+
+- Reevaluates risk from live metrics + context  
+- Emits `decision (project_ai)` with `project_assessment`  
+- Updates project **risk level** on the card  
+- May mark project **completed** when all tasks are done and no blockers  
+- Visible under **What changed recently** and **Log**  
+
+Blocked tasks still trigger **Orchestrator replan** as before.
+
+### Blockers
+
+- Mark a task **Blocked** with notes → blocker recorded; replan may run  
+- Mark **In progress** or **Done** → blocker for that task is **cleared** automatically  
+
+### Help chat (Leadership)
+
+`POST /api/help-chat` — conversational Q&A with live project/org context. Agent picker: Auto, Org AI, Orchestrator, Project AI, Team Builder, Scheduler. Falls back to metrics-only answers if no LLM is configured.
+
+### Event types
+
+Core types: `request`, `plan_created`, `assignment`, `unassignment`, `schedule_proposed`, `execution`, `decision`, `need`.  
+See [`docs/event-model.md`](docs/event-model.md). `unassignment` clears assignees when someone leaves a project or goes on leave.
 
 ---
 
@@ -59,34 +169,33 @@ The **Leadership View** (React) is read-only for executives: projects, risk, blo
 | Requirement | Version / notes |
 |-------------|-----------------|
 | **Node.js** | **18+** (20+ recommended for Google Gen AI SDK) |
-| **npm** | 9+ (ships with Node 20+) |
-| **PostgreSQL** | 14+ compatible database (hosted or local) |
+| **npm** | 9+ |
+| **PostgreSQL** | 14+ (Neon recommended) |
 | **Git** | To clone the repository |
 
 ### Optional (for full AI responses)
 
 | Requirement | Purpose |
 |-------------|---------|
-| **Google Gemini API key** | `GOOGLE_API_KEY` or `GEMINI_API_KEY` — [Google AI Studio](https://aistudio.google.com/apikey) |
-| **OpenAI API key** | `OPENAI_API_KEY` — [OpenAI platform](https://platform.openai.com/api-keys) |
-| **Ollama** | Local models at `http://localhost:11434` — [ollama.com](https://ollama.com) |
+| **Google Gemini API key** | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
+| **OpenAI API key** | `OPENAI_API_KEY` |
+| **Ollama** | Local models at `http://localhost:11434` |
 
-Without an API key, agent services use **deterministic stubs** so you can run and demo the loop end-to-end.
+Without an API key, agents use **deterministic stubs** so you can demo the full loop.
 
 ### Network / ports (local dev)
 
 | Port | Service |
 |------|---------|
-| `3000` | Express API (default `PORT`) |
-| `5173` | Vite dev server (Leadership View) |
+| `3000` | Express API |
+| `5173` | Leadership View |
+| `5174` | Worker Portal |
 
 ---
 
 ## Quick start (local)
 
 ### 1. Clone and install dependencies
-
-Install at the **repository root** (provides `pg` for the database layer) and in **server** and **client**:
 
 ```bash
 git clone <your-repo-url> AI-Native-Organization-System
@@ -95,6 +204,7 @@ cd AI-Native-Organization-System
 npm install
 cd server && npm install && cd ..
 cd client && npm install && cd ..
+cd worker && npm install && cd ..
 ```
 
 ### 2. Configure environment
@@ -103,50 +213,44 @@ cd client && npm install && cd ..
 cp .env.example .env
 ```
 
-Edit `.env` and set **`DATABASE_URL`** (required). See [Environment variables](#environment-variables).
+Set **`DATABASE_URL`** (required). See [Environment variables](#environment-variables).
 
-**Neon (recommended for a free hosted DB):**
-
-1. Create a project at [neon.tech](https://neon.tech).  
-2. Copy the connection string (include `?sslmode=require` if prompted).  
-3. Paste it as `DATABASE_URL` in `.env`.
-
-**Local Postgres example:**
-
-```env
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/ai_native_org
-```
+**Neon example:** create a project at [neon.tech](https://neon.tech), copy the connection string (often with `?sslmode=require`).
 
 ### 3. Start the API server
 
-From the **project root** (loads `.env` from the root):
+From the **project root**:
 
 ```bash
 npm start
-# or: node server/index.js
 ```
 
-On success you should see:
+Expected:
 
 ```text
 Store ready (Postgres).
 Server listening on port 3000
 ```
 
-Tables are created automatically on first start. Default **people** are seeded when the `people` table is empty.
+Tables are created on first start. Default **people** (Harry Potter–themed demo roster) seed when empty.
 
-### 4. Start the Leadership View
+### 4. Start the frontends
 
-In a **second terminal**:
+**Leadership View** (terminal 2):
 
 ```bash
-cd client
-npm run dev
+npm run dev:client
+# Open http://localhost:5173
 ```
 
-Open **http://localhost:5173**
+**Worker Portal** (terminal 3):
 
-The Vite dev server proxies `/api/*` to `http://localhost:3000` (see `client/vite.config.js`), so the UI talks to the API without CORS setup.
+```bash
+npm run dev:worker
+# Open http://localhost:5174
+```
+
+The Vite dev servers proxy `/api/*` to `http://localhost:3000`.
 
 ### 5. (Optional) Seed sample data
 
@@ -154,120 +258,88 @@ The Vite dev server proxies `/api/*` to `http://localhost:3000` (see `client/vit
 node server/scripts/seed-mock-data.js
 ```
 
-Uses `mock-data/people.json` and `mock-data/events.json` if present; otherwise seeds default people from the store.
-
 ---
 
 ## Environment variables
 
-All variables are read from **`.env` in the project root** when you start the server from the root.
+Read from **`.env` in the project root** when starting the server from the root.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `DATABASE_URL` | **Yes** | — | Postgres connection string |
-| `PORT` | No | `3000` | HTTP port for the API |
-| `POSTGRES_SCHEMA` | No | `public` | Schema for tables (useful on Neon) |
+| `PORT` | No | `3000` | API port |
+| `POSTGRES_SCHEMA` | No | `public` | Postgres schema |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | No | — | Google Gemini |
 | `OPENAI_API_KEY` | No | — | OpenAI |
-| `LLM_PROVIDER` | No | auto | Force `google`, `openai`, or `ollama` |
-| `OLLAMA_BASE_URL` | No | `http://localhost:11434` | Ollama server URL |
-| `OLLAMA_MODEL` | No | `llama3.1:8b` | Ollama model tag |
-| `OLLAMA_TIMEOUT_MS` | No | — | Ollama request timeout (ms) |
-| `OLLAMA_NUM_PREDICT` | No | `2048` | Max tokens for Ollama |
-| `LLM_MAX_RETRIES` | No | `5` | Retries when LLM returns null |
-| `LLM_RETRY_DELAY_MS` | No | `3000` | Delay between LLM retries (ms) |
-| `AGENT_LLM_TIMEOUT_MS` | No | `2500` / `60000` (Ollama) | Per-agent LLM call timeout |
-| `AGENT_STEP_RETRIES` | No | `3` | Orchestration step retries |
-| `AGENT_STEP_RETRY_DELAY_MS` | No | `1500` | Delay between step retries |
-| `VITE_API_URL` | No | `/api` | Client API base (production or custom backend) |
-| `CONFIRM_CLEAN` | No | — | Set to `1` to allow `clean-database.js` without prompt |
+| `LLM_PROVIDER` | No | auto | `google`, `openai`, or `ollama` |
+| `OLLAMA_*` | No | see `.env.example` | Ollama URL, model, timeouts |
+| `LLM_MAX_RETRIES` | No | `5` | LLM retries |
+| `VITE_API_URL` | No | `/api` | Frontend API base (build time) |
+| `VITE_WORKER_PORTAL_URL` | No | `http://localhost:5174` | Link in Leadership header |
+| `VITE_LEADERSHIP_URL` | No | `http://localhost:5173` | Link in Worker Portal |
+| `CONFIRM_CLEAN` | No | — | Set `1` for `clean-database.js` |
 
-Copy `.env.example` for a commented template.
+Copy [`.env.example`](.env.example) for the full template.
 
-**LLM selection order (when `LLM_PROVIDER` is unset):**
-
-1. Google, if `GOOGLE_API_KEY` or `GEMINI_API_KEY` is set  
-2. Else OpenAI, if `OPENAI_API_KEY` is set  
-3. Else Ollama (local), if reachable  
-4. Else stub responses in agent services  
+**LLM order (auto):** Google → OpenAI → Ollama → stubs.
 
 ---
 
 ## Running the application
 
-### Development (two terminals)
+### Development (three terminals)
 
-**Terminal 1 — API**
+| Terminal | Command | URL |
+|----------|---------|-----|
+| 1 | `npm start` (root) | API :3000 |
+| 2 | `npm run dev:client` | Leadership :5173 |
+| 3 | `npm run dev:worker` | Worker :5174 |
 
-```bash
-# from project root
-npm start
-```
+### Production (separate hosts)
 
-**Terminal 2 — UI**
-
-```bash
-cd client
-npm run dev
-```
-
-| URL | What |
-|-----|------|
-| http://localhost:5173 | Leadership View |
-| http://localhost:3000/health | API health check |
-| http://localhost:3000/events/projects | Project states (JSON) |
-
-### Production-style client build
+**Leadership View**
 
 ```bash
 cd client
+VITE_API_URL=https://your-api.example.com \
+VITE_WORKER_PORTAL_URL=https://workers.example.com \
 npm run build
-npm run preview   # serves dist on port 4173 by default
+# Serve client/dist/
 ```
 
-Set `VITE_API_URL` to your deployed API origin if the UI is not served behind the same proxy.
+**Worker Portal**
 
-### Exposing via ngrok (optional)
+```bash
+cd worker
+VITE_API_URL=https://your-api.example.com \
+VITE_LEADERSHIP_URL=https://leadership.example.com \
+npm run build
+# Serve worker/dist/
+```
 
-If you tunnel the Vite dev server, add your ngrok host to `allowedHosts` in `client/vite.config.js`. The API must still be reachable (proxy targets `localhost:3000`).
+Enable CORS on the API for both frontend origins.
 
 ---
 
 ## Verify your setup
 
-### Health check
-
 ```bash
 curl -s http://localhost:3000/health | jq
 ```
-
-Expected:
-
-```json
-{
-  "status": "ok",
-  "service": "ai-native-org",
-  "store": "postgres"
-}
-```
-
-### Postgres diagnostic
 
 ```bash
 node server/scripts/postgres-diagnostic.js
 ```
 
-### Submit a request event
-
-Replace `<UUID>` and `<ISO8601>` (or use `uuidgen` and `date -u +%Y-%m-%dT%H:%M:%SZ`):
+Submit a demo request:
 
 ```bash
 curl -X POST http://localhost:3000/events \
   -H "Content-Type: application/json" \
   -d '{
-    "id": "<UUID>",
+    "id": "00000000-0000-4000-8000-000000000001",
     "type": "request",
-    "timestamp": "<ISO8601>",
+    "timestamp": "2026-06-03T12:00:00.000Z",
     "projectId": "proj-demo-1",
     "source": "human",
     "payload": {
@@ -278,32 +350,64 @@ curl -X POST http://localhost:3000/events \
   }'
 ```
 
-Then refresh the Leadership View **Projects** tab or:
-
-```bash
-curl -s http://localhost:3000/events/projects | jq
-```
-
-Orchestration runs asynchronously for `request` events (plan → assign → schedule).
-
 ---
 
 ## Demo workflow
 
-1. Open the Leadership View → **Actions** → create a **New request** (project id + title).  
-2. Watch **Projects** populate as orchestration emits events.  
-3. Open **Log** or **LLM Logs** for agent activity (requires LLM key for rich LLM logs).  
-4. Submit an **execution** or **decision** event from **Actions**.  
-5. **Overview** loads org metrics and AI insights (best-effort; may use stubs).  
+### Leadership path
 
-No status meetings required.
+1. Open Leadership View → **Actions** → create a **New request**.  
+2. Watch **Projects** as orchestration runs (plan → assign → schedule).  
+3. Open **Log** / **LLM Logs** for agent traces (with LLM keys).  
+4. Use **Help** (bottom-right) to ask about project status.  
+5. **Worker requests** tab — review human needs from the portal.  
+
+### Worker path
+
+1. Open Worker Portal → log in as **Sam Lee** (`person-2`) or **Hermione Granger** (`person-5`, HR).  
+2. **Tasks** → mark work `done` → Leadership **Projects** shows `execution (human)` then `decision (project_ai)`.  
+3. Submit a **sick leave** request → log in as **Hermione** → **HR** → approve → employee unassigned and `on_leave`.  
+4. **Emergency return** — Hermione authorizes **Draco Malfoy** (`person-12`) for urgent work while leave remains on record.  
+
+### Clear a blocker
+
+Assignee or Leadership: set task status to **In progress** or **Done** (not Blocked). The blocker line disappears on refresh.
+
+---
+
+## Worker requests & HR workflows
+
+### Submitting a request (Worker Portal)
+
+1. **Requests** tab → choose type (shows **Forwards to: …**).  
+2. Pick handling: **AI agents**, **Notify teams**, or **Self-manage**.  
+3. Optional project, dates, description → **Submit**.  
+
+### Reviewing
+
+| Role | Where | Actions |
+|------|--------|---------|
+| HR | Worker → **HR** | Approve, reject, in review, close; create HR tasks |
+| Project lead / eng mgmt | Worker → **Reviews** | Same for project-scoped requests |
+| Leadership | **Worker requests** tab | Approve / reject / close (no HR role required) |
+
+### Request statuses
+
+`open` → `in_review` → `approved` | `rejected` | `met` | `cancelled`
+
+### People availability
+
+| Status | Meaning |
+|--------|---------|
+| `active` | Normal work |
+| `on_leave` | Approved sick leave / vacation; unassigned from tasks |
+| `emergency_active` | HR-authorized temporary work during leave |
 
 ---
 
 ## API reference
 
-Base URL in local dev: `http://localhost:3000`  
-Routes are also mounted under `/api` (e.g. `/api/events`).
+Base URL: `http://localhost:3000` (also under `/api/…`).
 
 **Authentication:** none in MVP.
 
@@ -311,31 +415,63 @@ Routes are also mounted under `/api` (e.g. `/api/events`).
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/events` | Submit an event. `type: request` triggers orchestration. |
-| `GET` | `/events` | Recent events (`?projectId=` optional) |
-| `GET` | `/events/stream` | SSE stream for live UI updates |
-| `GET` | `/events/projects` | All project states |
-| `GET` | `/events/projects/:id` | One project state |
-| `GET` | `/events/agent-activity` | Agent activity log (`?projectId=` optional) |
-| `GET` | `/events/llm-logs` | LLM prompts/responses (`?projectId=`, `?agent=` optional) |
-| `GET` | `/events/needs` | Needs list (`?projectId=`, `?status=` optional) |
-| `GET` | `/events/projects/:id/needs` | Needs for one project |
-| `PATCH` | `/events/needs/:id` | Update need status (`open` \| `met` \| `cancelled`) |
-| `POST` | `/events/worker/status` | Assignee updates task status |
+| `POST` | `/events` | Submit event. `type: request` → orchestration. Human `execution` → Project AI reevaluation. |
+| `GET` | `/events` | Recent events (`?projectId=`) |
+| `GET` | `/events/stream` | SSE live updates |
+| `GET` | `/events/projects` | All projects (on-leave assignees hidden on card) |
+| `GET` | `/events/projects/:id` | One project |
+| `GET` | `/events/agent-activity` | Agent log (`?projectId=`) |
+| `GET` | `/events/llm-logs` | LLM traces (`?projectId=`, `?agent=`) |
+| `GET` | `/events/needs` | Worker requests / needs (`?status=`) |
+| `PATCH` | `/events/needs/:id` | Update need: `open`, `in_review`, `approved`, `rejected`, `met`, `cancelled` |
+| `POST` | `/events/worker/status` | Legacy task status path |
 
-### Org insights
+**PATCH body example:** `{ "status": "approved", "reviewedBy": "leadership", "reviewNotes": "…" }`
+
+### Org insights & help
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/org-insights` | Metrics + AI-generated org/project/people insights |
+| `GET` | `/org-insights` | Metrics + AI insights |
+| `GET` | `/help-chat/meta` | Suggested questions + agents |
+| `POST` | `/help-chat` | Leadership help chat (`message`, `agent`, `projectId`, `messages`) |
+
+### Worker Portal (`/worker` and `/api/worker`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/worker/people` | People for login (`?q=`) |
+| `GET` | `/worker/dashboard` | Home data (`?personId=`) |
+| `GET` | `/worker/meta` | Request kinds, handling modes, routing map |
+| `POST` | `/worker/status` | Update own task status |
+| `POST` | `/worker/requests` | Submit worker request |
+| `PATCH` | `/worker/requests/:id` | HR / assigned reviewer updates status |
+| `POST` | `/worker/requests/:id/tasks` | HR creates follow-up task |
+| `GET` | `/worker/hr/inbox` | HR queue (`?personId=`) |
+| `GET` | `/worker/project/inbox` | Project-scoped reviews (`?personId=`) |
+| `GET` | `/worker/hr/on-leave` | People on leave / emergency (`?personId=` HR) |
+| `POST` | `/worker/hr/emergency-activate` | HR authorizes emergency work |
+| `POST` | `/worker/hr/emergency-end` | End emergency (`returnTo`: `leave` \| `active`) |
+
+**Emergency activate body:**
+
+```json
+{
+  "hrPersonId": "person-5",
+  "targetPersonId": "person-12",
+  "reason": "Production outage",
+  "projectId": "proj-school-website",
+  "taskId": "task-1"
+}
+```
 
 ### Health
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health` | Service health |
+| `GET` | `/health` | `{ "status": "ok", "store": "postgres" }` |
 
-Event schemas and state rules: [`docs/event-model.md`](docs/event-model.md).
+Event schemas: [`docs/event-model.md`](docs/event-model.md).
 
 ---
 
@@ -343,51 +479,65 @@ Event schemas and state rules: [`docs/event-model.md`](docs/event-model.md).
 
 ```text
 AI-Native-Organization-System/
-├── .env.example              # Environment template
+├── .env.example
 ├── README.md
-├── package.json              # Root: pg, dotenv; npm start runs server
+├── package.json              # Root: pg, dotenv; npm start
 ├── docs/
-│   ├── architecture.md
-│   ├── event-model.md
-│   ├── orchestration-loop.md
-│   └── principles.md
-├── prompts/                  # LLM system prompts
+├── prompts/
 │   ├── orchestrator.txt
 │   ├── teamBuilder.txt
 │   ├── scheduler.txt
-│   ├── projectAI.txt
-│   └── orgAI.txt
-├── mock-data/                # Optional seed JSON (people.json, events.json)
+│   ├── projectAI.txt         # Project assessment after human execution
+│   ├── orgAI.txt
+│   └── helpChat.txt
+├── mock-data/
 ├── server/
-│   ├── index.js              # Express entry
-│   ├── db/                   # Postgres pool
+│   ├── index.js
+│   ├── constants/
+│   │   ├── workerRequests.js
+│   │   └── requestRouting.js # Per-kind role + AI agent routing
 │   ├── routes/
-│   │   ├── events.js         # Event intake, SSE, orchestration
-│   │   └── orgInsights.js
-│   ├── services/             # orchestratorAI, teamBuilderAI, schedulerAI, …
-│   ├── models/               # eventSchema, projectState
-│   ├── store/postgresStore.js
-│   ├── lib/                  # llm, agentActivityLog, …
-│   └── scripts/              # seed, migrate, diagnostic, clean
-└── client/                   # React Leadership View (Vite)
+│   │   ├── events.js
+│   │   ├── worker.js
+│   │   ├── orgInsights.js
+│   │   └── helpChat.js
+│   ├── services/
+│   │   ├── orchestratorAI.js
+│   │   ├── teamBuilderAI.js
+│   │   ├── schedulerAI.js
+│   │   ├── projectAIEvaluator.js
+│   │   ├── workerRequestHandler.js
+│   │   ├── workerRequestEffects.js
+│   │   ├── emergencyReturn.js
+│   │   └── metrics.js
+│   ├── lib/
+│   │   ├── llm.js
+│   │   ├── hrRouting.js          # Re-exports requestRouting
+│   │   ├── workerRequestLifecycle.js
+│   │   ├── personAvailability.js
+│   │   └── reconcileApprovedRequests.js
+│   ├── models/
+│   └── store/postgresStore.js
+├── client/                   # Leadership View
+│   ├── src/App.jsx
+│   ├── src/HelpChat.jsx
+│   └── vite.config.js
+└── worker/                   # Worker Portal
     ├── src/App.jsx
-    ├── src/App.css
-    └── vite.config.js        # Dev proxy /api → :3000
+    └── vite.config.js
 ```
 
 ---
 
 ## Utility scripts
 
-Run from the **project root** with `.env` configured.
-
 | Command | Purpose |
 |---------|---------|
-| `node server/scripts/postgres-diagnostic.js` | Connection and table counts |
-| `node server/scripts/seed-mock-data.js` | Seed people and optional events |
-| `node server/scripts/clean-database.js` | Wipe tables (set `CONFIRM_CLEAN=1`) |
-| `node server/scripts/migrate-to-postgres.js` | Legacy JSON → Postgres migration |
-| `node server/scripts/test-rag-agents.js` | Exercise retrieval / agent context |
+| `node server/scripts/postgres-diagnostic.js` | DB connection and counts |
+| `node server/scripts/seed-mock-data.js` | Seed people / events |
+| `node server/scripts/clean-database.js` | Wipe tables (`CONFIRM_CLEAN=1`) |
+| `node server/scripts/migrate-to-postgres.js` | Legacy JSON → Postgres |
+| `node server/scripts/test-rag-agents.js` | Agent context / retrieval test |
 
 ---
 
@@ -395,59 +545,69 @@ Run from the **project root** with `.env` configured.
 
 | Doc | Contents |
 |-----|----------|
-| [`docs/principles.md`](docs/principles.md) | Product and ethics principles |
-| [`docs/architecture.md`](docs/architecture.md) | Components and core loop |
-| [`docs/event-model.md`](docs/event-model.md) | Event types and project state |
+| [`docs/principles.md`](docs/principles.md) | Product and ethics |
+| [`docs/architecture.md`](docs/architecture.md) | Components and loop |
+| [`docs/event-model.md`](docs/event-model.md) | Event types and state |
 | [`docs/orchestration-loop.md`](docs/orchestration-loop.md) | Orchestration pseudocode |
+| [`worker/README.md`](worker/README.md) | Worker app–only notes |
 
 ---
 
 ## Troubleshooting
 
-### Server exits immediately: `DATABASE_URL is required`
+### Server exits: `DATABASE_URL is required`
 
-- Create `.env` in the **project root** (not only under `server/`).  
-- Start the server from the root: `npm start` or `node server/index.js`.
+Create `.env` in the **project root** and run `npm start` from the root.
 
-### `Failed to start server` / Postgres connection errors
+### Worker login returns **Not Found**
 
-- Confirm the connection string works with `psql` or Neon console.  
-- For Neon, use `?sslmode=require` in `DATABASE_URL`.  
-- Run `node server/scripts/postgres-diagnostic.js`.
+Restart the API after pulling changes — `/worker` routes must be loaded (`npm start` from root).
 
-### UI shows “Error” or empty data
+### Worker request stuck; no HR inbox
 
-- Ensure the API is running on port **3000**.  
-- In dev, use `npm run dev` in `client/` (proxy expects API on 3000).  
-- Check browser network tab: requests should go to `/api/...`.
+Check routing: workload / contribution on a project → **Reviews**, not HR. See `requiresHrInbox` in API responses.
 
-### AI always uses stub plans
+### Approved sick leave but person still on tasks
 
-- Set `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or run Ollama and optionally `LLM_PROVIDER=ollama`.  
-- Check server logs for `[LLM]` lines.  
-- Inspect **LLM Logs** tab after submitting a request.
+Restart API once — reconciliation applies unassignment and leave notices for past approvals.
 
-### `npm install` / module not found (`pg`)
+### Project AI / help chat always stubbed
 
-- Run `npm install` at the **repository root** (installs `pg`) in addition to `server/` and `client/`.
+Set `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or run Ollama. Check server logs for `[LLM]`.
+
+### Blocker will not clear
+
+Set task to **In progress** or **Done** via Worker Portal or Leadership **Actions** → execution event.
+
+### `npm install` / `pg` not found
+
+Run `npm install` at the **repository root**, not only in `server/`.
 
 ---
 
 ## Design principles & guardrails
 
 - **AI owns information flow; humans own judgment.**  
-- **Everything is an event** — no manual “reporting” path.  
-- **Explainability** — agent outputs include rationale where applicable.  
-- **No silent decisions** — humans can override via decision events.  
-- **Ethics** — AI does not evaluate human worth; no surveillance features in MVP.
+- **Everything is an event** — state changes are traceable.  
+- **Explainability** — rationales on agent and system events.  
+- **No silent decisions** — humans approve requests and decisions.  
+- **Leave is enforced** — emergency return is HR-gated and audited.  
+- **Ethics** — no surveillance; AI does not score human worth.
 
 ---
 
 ## Status
 
-**MVP** — event schemas, Postgres persistence, orchestration loop, Leadership View (overview, projects, actions, agent log, LLM logs), org insights, SSE live updates, dark/light theme.
+**MVP+** includes:
 
-**Not in MVP** — authentication, Slack/Jira/calendar integrations, autonomous decisions without human events.
+- Event-driven orchestration and Postgres persistence  
+- Leadership View (overview, projects, actions, logs, LLM logs, worker requests, help chat)  
+- Worker Portal (tasks, routed requests, HR inbox, project reviews, emergency return)  
+- Worker request lifecycle (approve → side effects, unassignment, availability)  
+- Project AI reevaluation on human execution  
+- Org insights, SSE, themes  
+
+**Not in MVP** — authentication, Slack/Jira/calendar integrations, email notifications.
 
 ---
 
