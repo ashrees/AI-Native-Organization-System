@@ -8,6 +8,7 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import HelpChat from './HelpChat';
+import WorkforcePanel from './WorkforcePanel';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 const WORKER_PORTAL_URL =
@@ -56,6 +57,36 @@ function logMessageShort(text, maxSentences = 2) {
   return sentences.slice(0, maxSentences).join(' ');
 }
 
+/** Event types shown under "What changed recently" (excludes assignment/plan noise). */
+function isRecentChangeEvent(event) {
+  return ['execution', 'decision', 'unassignment'].includes(event.type);
+}
+
+function recentEventSummary(event, project) {
+  const direct = event.rationale || event.message;
+  if (direct) return logMessageShort(direct);
+  const p = event.payload || {};
+  if (event.type === 'execution' && p.taskId) {
+    const task = (project?.progress?.tasks || []).find((t) => t.id === p.taskId);
+    const title = task?.title || p.taskId;
+    const statusLabel = String(p.status || 'updated').replace(/_/g, ' ');
+    let msg = `Task "${title}" marked ${statusLabel}`;
+    if (p.notes) msg += `: ${p.notes}`;
+    return logMessageShort(msg);
+  }
+  if (event.type === 'decision' && p.decisionType === 'assignment_gap_fill') {
+    const n = p.assignedCount ?? 0;
+    return logMessageShort(
+      event.rationale ||
+        `Assignment gap fill: ${n} unassigned task(s) assigned by Team Builder.`
+    );
+  }
+  if (p.reason) return logMessageShort(String(p.reason));
+  if (p.summary) return logMessageShort(String(p.summary));
+  if (p.description) return logMessageShort(String(p.description));
+  return '';
+}
+
 export default function App() {
   const [theme, setTheme] = useState(getStoredTheme);
   const [projects, setProjects] = useState([]);
@@ -64,12 +95,24 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [submitStatus, setSubmitStatus] = useState(null);
+  const [activeTab, setActiveTab] = useState('overview');
+  const [logProjectId, setLogProjectId] = useState('');
+  const [logEvents, setLogEvents] = useState([]);
+  const [logLoading, setLogLoading] = useState(false);
+  const [llmProjectId, setLlmProjectId] = useState('');
+  const [llmLogs, setLlmLogs] = useState([]);
+  const [llmLoading, setLlmLoading] = useState(false);
+  const [needs, setNeeds] = useState([]);
+  const [needsLoading, setNeedsLoading] = useState(false);
+  const [workforce, setWorkforce] = useState(null);
+  const [workforceLoading, setWorkforceLoading] = useState(false);
+  const [workforceError, setWorkforceError] = useState(null);
 
   const load = useCallback(async () => {
     try {
       const [projectsRes, eventsRes] = await Promise.all([
         fetchJson('/events/projects'),
-        fetchJson('/events'),
+        fetchJson('/events?recentChanges=1&limit=300'),
       ]);
       const list = (projectsRes.projects || [])
         .slice()
@@ -79,7 +122,7 @@ export default function App() {
           return tb - ta; // latest first
         });
       setProjects(list);
-      const events = eventsRes.events || [];
+      const events = (eventsRes.events || []).filter(isRecentChangeEvent);
       const byProject = {};
       for (const e of events) {
         const pid = e.projectId;
@@ -87,19 +130,10 @@ export default function App() {
         byProject[pid].push(e);
       }
       for (const pid of Object.keys(byProject)) {
-        byProject[pid].sort((a, b) => {
-          const priority = (e) => {
-            if (e.type === 'unassignment' || e.payload?.decisionType === 'member_on_leave') return 0;
-            if (e.payload?.decisionType === 'project_assessment') return 1;
-            if (e.type === 'decision') return 2;
-            return 3;
-          };
-          const pa = priority(a);
-          const pb = priority(b);
-          if (pa !== pb) return pa - pb;
-          return new Date(b.timestamp) - new Date(a.timestamp);
-        });
-        byProject[pid] = byProject[pid].slice(0, 12);
+        byProject[pid].sort(
+          (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+        );
+        byProject[pid] = byProject[pid].slice(0, 15);
       }
       setEventsByProject(byProject);
     } catch (err) {
@@ -155,6 +189,11 @@ export default function App() {
         load();
         // best-effort refresh for org insights (non-blocking)
         fetchJson('/org-insights').then(setOrgInsights).catch(() => {});
+        if (activeTab === 'workforce') {
+          fetchJson('/workforce/analytics')
+            .then(setWorkforce)
+            .catch((e) => setWorkforceError(e.message));
+        }
       }, 350);
     };
 
@@ -169,17 +208,30 @@ export default function App() {
       if (timer) clearTimeout(timer);
       es.close();
     };
-  }, [load]);
+  }, [load, activeTab]);
 
-  const [activeTab, setActiveTab] = useState('overview');
-  const [logProjectId, setLogProjectId] = useState('');
-  const [logEvents, setLogEvents] = useState([]);
-  const [logLoading, setLogLoading] = useState(false);
-  const [llmProjectId, setLlmProjectId] = useState('');
-  const [llmLogs, setLlmLogs] = useState([]);
-  const [llmLoading, setLlmLoading] = useState(false);
-  const [needs, setNeeds] = useState([]);
-  const [needsLoading, setNeedsLoading] = useState(false);
+  useEffect(() => {
+    if (activeTab !== 'workforce') return undefined;
+    let cancelled = false;
+    setWorkforceLoading(true);
+    setWorkforceError(null);
+    fetchJson('/workforce/analytics')
+      .then((data) => {
+        if (!cancelled) setWorkforce(data);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setWorkforceError(err.message);
+          setWorkforce(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setWorkforceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
 
   // Load events + agent activity for Log tab when project is selected (orchestrator, team_builder, scheduler, project_ai, org_ai)
   useEffect(() => {
@@ -356,6 +408,13 @@ export default function App() {
           </button>
           <button
             type="button"
+            className={`nav-tab ${activeTab === 'workforce' ? 'active' : ''}`}
+            onClick={() => setActiveTab('workforce')}
+          >
+            Workforce
+          </button>
+          <button
+            type="button"
             className={`nav-tab ${activeTab === 'needs' ? 'active' : ''}`}
             onClick={() => setActiveTab('needs')}
           >
@@ -463,6 +522,17 @@ export default function App() {
             {!logProjectId && activeTab === 'log' && (
               <p className="empty">Select a project above to see AI agent logs (orchestrator, team_builder, scheduler, project_ai, org_ai).</p>
             )}
+          </section>
+        )}
+
+        {activeTab === 'workforce' && (
+          <section className="app-section" aria-labelledby="section-workforce">
+            <h2 id="section-workforce" className="section-title">Workforce analytics</h2>
+            <WorkforcePanel
+              data={workforce}
+              loading={workforceLoading}
+              error={workforceError}
+            />
           </section>
         )}
 
@@ -798,6 +868,7 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
   const [taskId, setTaskId] = useState('');
   const [status, setStatus] = useState('in_progress');
   const [notes, setNotes] = useState('');
+  const [requestAssignment, setRequestAssignment] = useState(false);
   const [decisionType, setDecisionType] = useState('reprioritize');
   const [reason, setReason] = useState('');
 
@@ -814,7 +885,12 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
     let payload, type;
     if (eventType === 'execution') {
       type = 'execution';
-      payload = { taskId, status, notes: notes || undefined };
+      payload = {
+        taskId,
+        status,
+        notes: notes || undefined,
+        requestAssignment: requestAssignment || undefined,
+      };
     } else {
       type = 'decision';
       payload = { decisionType, reason: reason || undefined };
@@ -839,6 +915,7 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
       <h3>Submit event</h3>
       <p className="submit-event-desc">
         Execution: update task status. To clear a blocker, set the task to In progress or Done (not Blocked).
+        Optionally request AI to assign unassigned tasks (Team Builder only — no full replan).
         Decision: human judgment (reprioritize or kill project).
       </p>
       <form onSubmit={handleSubmit}>
@@ -881,6 +958,14 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
               Notes (optional)
               <input type="text" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="e.g. blocker reason" />
             </label>
+            <label className="checkbox-label">
+              <input
+                type="checkbox"
+                checked={requestAssignment}
+                onChange={(e) => setRequestAssignment(e.target.checked)}
+              />
+              Request AI to assign unassigned tasks on this project
+            </label>
           </>
         )}
         {eventType === 'decision' && (
@@ -909,6 +994,9 @@ function ProjectCard({ project, recentEvents }) {
   const risk = project.risk?.level || 'low';
   const reasons = project.risk?.reasons || [];
   const blockers = project.blockers || [];
+  const sortedRecent = [...recentEvents].sort(
+    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+  );
 
   return (
     <article className="project-card">
@@ -988,16 +1076,27 @@ function ProjectCard({ project, recentEvents }) {
         </div>
       )}
 
-      {recentEvents.length > 0 && (
-        <dl className="recent-events">
-          <dt>What changed recently</dt>
-          {recentEvents.map((e) => (
-            <dd key={e.id}>
-              <strong>{e.type}</strong> ({e.source}) — {new Date(e.timestamp).toLocaleString()}
-              {e.rationale && ` — ${logMessageShort(e.rationale)}`}
-            </dd>
-          ))}
-        </dl>
+      {sortedRecent.length > 0 && (
+        <section className="recent-events" aria-label="What changed recently">
+          <h3 className="recent-events-title">What changed recently</h3>
+          <ol className="log-list recent-events-list">
+            {sortedRecent.map((e) => {
+              const summary = recentEventSummary(e, project);
+              return (
+                <li key={e.id} className="log-entry recent-events-item">
+                  <time className="recent-events-time" dateTime={e.timestamp}>
+                    {new Date(e.timestamp).toLocaleString()}
+                  </time>
+                  <span className="log-meta">
+                    <strong>{e.type}</strong>
+                    <span className="recent-events-source">({e.source})</span>
+                  </span>
+                  {summary && <p className="log-message recent-events-summary">{summary}</p>}
+                </li>
+              );
+            })}
+          </ol>
+        </section>
       )}
     </article>
   );

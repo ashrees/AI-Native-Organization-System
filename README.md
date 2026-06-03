@@ -37,7 +37,7 @@ Modern teams lose time to status meetings, fragmented tools, and manual triage. 
 3. **Team Builder AI** assigns people with rationale  
 4. **Scheduler AI** proposes timelines  
 5. **Humans execute** and emit events  
-6. **Project AI** reevaluates risk after each human execution  
+6. **Project AI** monitors status continuously and **delegates** to other agents when needed  
 7. **Project state** updates from events only  
 8. **Leadership View** shows what changed and why  
 9. **Replan** triggers on blockers or reprioritization  
@@ -50,7 +50,7 @@ Modern teams lose time to status meetings, fragmented tools, and manual triage. 
 |--------|------------|
 | API | Node.js 18+, Express |
 | Persistence | PostgreSQL via `pg` |
-| AI | Google Gemini, OpenAI, or Ollama (optional; stubs without keys) |
+| AI | Google Gemini, OpenAI, or Ollama Cloud / local (optional; stubs without keys) |
 | Leadership UI | React 18, Vite 5 (`client/`, port 5173) |
 | Worker UI | React 18, Vite 5 (`worker/`, port 5174) — separate deploy |
 | Real-time | Server-Sent Events (SSE) |
@@ -64,7 +64,7 @@ Three apps share one API; each can be hosted independently.
 | App | Path | Port (dev) | Audience |
 |-----|------|------------|----------|
 | **API server** | `server/` | 3000 | All clients |
-| **Leadership View** | `client/` | 5173 | Executives — overview, projects, actions, logs, help chat |
+| **Leadership View** | `client/` | 5173 | Executives — overview, projects, workforce, actions, logs, help chat |
 | **Worker Portal** | `worker/` | 5174 | Individual contributors — tasks, status, HR/ops requests |
 
 Leadership View links to the Worker Portal via `VITE_WORKER_PORTAL_URL`. The Worker Portal links back via `VITE_LEADERSHIP_URL`.
@@ -76,18 +76,20 @@ Leadership View links to the Worker Portal via `VITE_WORKER_PORTAL_URL`. The Wor
 ### Leadership View (`client/`)
 
 - **Overview** — org metrics and AI-generated insights (background refresh)  
-- **Projects** — live state, tasks, assignees, blockers, risk, “What changed recently”  
-- **Actions** — submit work `request` events and human `execution` / `decision` events  
-- **Log** — orchestrator, team_builder, scheduler, project_ai activity  
+- **Projects** — live state, tasks, assignees, blockers, risk; **What changed recently** (newest first, human + AI rationale)  
+- **Workforce** — productivity matrix, health scores (0–100), department charts, per-person detail  
+- **Actions** — submit `request`, human `execution`, and `decision` events; assignment gap-fill checkbox  
+- **Log** — orchestrator, team_builder, scheduler, project_ai, org_ai activity  
 - **LLM Logs** — full prompts and responses per project  
-- **Worker requests** — all human `need` events; leadership can approve/reject/close  
-- **Help chat** (floating) — ask Org AI / Orchestrator / Project AI with live store context  
+- **Worker requests** — all human `need` events; leadership approve/reject/close  
+- **Help chat** (floating) — full org snapshot + workforce analytics; routes to Org AI, Orchestrator, Project AI, Team Builder, Scheduler  
 - **Dark / light theme**, SSE live refresh  
 
 ### Worker Portal (`worker/`)
 
 - **Login by name** — directory search (`GET /worker/people`)  
-- **Tasks** — update status (`in_progress`, `done`, `blocked`) on assigned work  
+- **Overview** — open assignments, active projects, open requests (no status-action buttons; use **Tasks** for updates)  
+- **Tasks** — filter by status; update `in_progress`, `done`, `blocked` on assigned work  
 - **Requests** — sick leave, vacation, workload, transfer, blockers, etc.  
 - **Handling modes** — AI agents (review tasks), notify teams, or self-manage  
 - **Routing preview** — each request type shows who it forwards to  
@@ -127,38 +129,80 @@ When HR or leadership **approves** a worker request, the system updates more tha
 While on approved leave, HR can temporarily authorize urgent work:
 
 1. Worker Portal → **HR** → **Emergency return to work**  
-2. Select person (e.g. Draco Malfoy), reason, optional project + task id  
+2. Select person, reason, optional project + task id  
 3. Status becomes `emergency_active` — leave stays on record  
 4. Optional immediate **assignment** to a task  
 5. When done: **End emergency → back on leave** or **→ fully returned**  
 
 API: `POST /worker/hr/emergency-activate`, `POST /worker/hr/emergency-end`.
 
-### Project AI after human execution
+### Project AI — status monitoring and agent coordination
 
-Every **human** `execution` event (Worker Portal or Leadership Actions) triggers **Project AI** asynchronously:
+**Project AI** runs asynchronously on project activity and on a **periodic timer** (default every 5 minutes):
 
-- Reevaluates risk from live metrics + context  
-- Emits `decision (project_ai)` with `project_assessment`  
-- Updates project **risk level** on the card  
-- May mark project **completed** when all tasks are done and no blockers  
+- **Triggers:** human `execution`, `plan_created`, `assignment`, `schedule_proposed`, `need`, reprioritize decisions, periodic poll  
+- **Assesses** risk from live metrics + RAG context  
+- **Emits** `decision (project_ai)` with `project_assessment` and planned `agentActions`  
+- **Delegates** to other agents when requirements demand it:
+
+| Delegate to | Action | When |
+|-------------|--------|------|
+| **Team Builder** | `assign_unassigned` / `assign_task` | Open tasks without owners |
+| **Scheduler** | `reschedule` | Assigned tasks missing schedule dates |
+| **Orchestrator** | `replan` | Blockers or stalled progress need a new plan |
+| **System** | `create_need` | Human input required (approval, unblock, capacity) |
+
+- Updates project **risk level**; may mark **completed** when all tasks are done  
 - Visible under **What changed recently** and **Log**  
 
-Blocked tasks still trigger **Orchestrator replan** as before.
+Env: `PROJECT_AI_DEBOUNCE_MS` (default 15s), `PROJECT_AI_POLL_INTERVAL_MS` (default 300000; `0` disables polling).
+
+Blocked tasks still trigger **immediate Orchestrator replan** in addition to Project AI review.
+
+### Assignment gap fill (Leadership Actions)
+
+When leadership submits an **execution** and any of these apply, the server runs **Team Builder only** on unassigned (non-done) tasks — no full Orchestrator replan:
+
+- Checkbox **“Request AI to assign unassigned tasks”** (`payload.requestAssignment: true`)
+- Task set to **in progress** while still **unassigned**
+- Notes mention assign / unassigned / ASAP (keyword match)
+
+Emits `assignment` + `schedule_proposed` per task, then `decision (system)` with `assignment_gap_fill`. People on leave are skipped.
 
 ### Blockers
 
 - Mark a task **Blocked** with notes → blocker recorded; replan may run  
 - Mark **In progress** or **Done** → blocker for that task is **cleared** automatically  
 
+### Workforce analytics (Leadership)
+
+`GET /api/workforce/analytics` — per-worker indexes (0–100):
+
+- **Productivity** — completion rate, 7d/30d throughput vs org  
+- **Reliability** — blocker share, recency, load balance  
+- **Engagement** — multi-project contribution, executions, review tasks  
+- **Health** — availability, overload, open distress requests, stagnation  
+- **Overall** — weighted blend; status bands: thriving / steady / watch / at_risk  
+
+Includes department summary, distribution, and heatmap matrix. Same data is included in **Help chat** context.
+
 ### Help chat (Leadership)
 
-`POST /api/help-chat` — conversational Q&A with live project/org context. Agent picker: Auto, Org AI, Orchestrator, Project AI, Team Builder, Scheduler. Falls back to metrics-only answers if no LLM is configured.
+`POST /api/help-chat` — conversational Q&A with a **full org snapshot**:
+
+- All projects (tasks, assignees, blockers, needs, schedules)  
+- All people (load, leave, availability)  
+- **Workforce analytics** (indexes, signals, department summary, highlights)  
+- All worker requests (routing, review status)  
+- Unassigned tasks, recent events (`HELP_CHAT_EVENT_LIMIT`, default 250)  
+- Recent agent activity, Org AI insights  
+
+Optional `projectId` scopes focus detail. Agents: Auto, Org AI, Orchestrator, Project AI, Team Builder, Scheduler.
 
 ### Event types
 
 Core types: `request`, `plan_created`, `assignment`, `unassignment`, `schedule_proposed`, `execution`, `decision`, `need`.  
-See [`docs/event-model.md`](docs/event-model.md). `unassignment` clears assignees when someone leaves a project or goes on leave.
+See [`docs/event-model.md`](docs/event-model.md).
 
 ---
 
@@ -179,7 +223,8 @@ See [`docs/event-model.md`](docs/event-model.md). `unassignment` clears assignee
 |-------------|---------|
 | **Google Gemini API key** | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | **OpenAI API key** | `OPENAI_API_KEY` |
-| **Ollama** | Local models at `http://localhost:11434` |
+| **Ollama Cloud** (recommended) | `OLLAMA_API_KEY` + `https://ollama.com` |
+| **Ollama local** | `http://localhost:11434` or local app proxy to Cloud |
 
 Without an API key, agents use **deterministic stubs** so you can demo the full loop.
 
@@ -229,6 +274,7 @@ Expected:
 
 ```text
 Store ready (Postgres).
+[Project AI] Status polling every 300s
 Server listening on port 3000
 ```
 
@@ -250,7 +296,7 @@ npm run dev:worker
 # Open http://localhost:5174
 ```
 
-The Vite dev servers proxy `/api/*` to `http://localhost:3000`.
+Vite dev servers proxy `/api/*` to `http://localhost:3000`.
 
 ### 5. (Optional) Seed sample data
 
@@ -272,8 +318,20 @@ Read from **`.env` in the project root** when starting the server from the root.
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | No | — | Google Gemini |
 | `OPENAI_API_KEY` | No | — | OpenAI |
 | `LLM_PROVIDER` | No | auto | `google`, `openai`, or `ollama` |
-| `OLLAMA_*` | No | see `.env.example` | Ollama URL, model, timeouts |
+| `OLLAMA_API_KEY` | No* | — | Ollama Cloud ([settings/keys](https://ollama.com/settings/keys)) |
+| `OLLAMA_BASE_URL` | No | `https://ollama.com` if key set | Ollama API host |
+| `OLLAMA_MODEL` | No | `gpt-oss:120b,nemotron-3-super,gpt-oss:20b` | Comma-separated fallbacks (cloud) |
+| `OLLAMA_TIMEOUT_MS` | No | `180000` (cloud) | Request timeout |
+| `OLLAMA_NUM_PREDICT` | No | `8192` (cloud) | Max tokens for Ollama |
 | `LLM_MAX_RETRIES` | No | `5` | LLM retries |
+| `LLM_RETRY_DELAY_MS` | No | `3000` | Delay between retries |
+| `AGENT_LLM_TIMEOUT_MS` | No | `25000` | Per-agent LLM timeout |
+| `AGENT_STEP_RETRIES` | No | `3` | Retries per orchestration step |
+| `AGENT_STEP_RETRY_DELAY_MS` | No | `1500` | Delay between step retries |
+| `PROJECT_AI_DEBOUNCE_MS` | No | `15000` | Min gap between Project AI checks per project |
+| `PROJECT_AI_POLL_INTERVAL_MS` | No | `300000` | Periodic status poll (`0` = off) |
+| `HELP_CHAT_EVENT_LIMIT` | No | `250` | Max events in help chat context |
+| `HELP_CHAT_ACTIVITY_LIMIT` | No | `40` | Max agent activity lines in help chat |
 | `VITE_API_URL` | No | `/api` | Frontend API base (build time) |
 | `VITE_WORKER_PORTAL_URL` | No | `http://localhost:5174` | Link in Leadership header |
 | `VITE_LEADERSHIP_URL` | No | `http://localhost:5173` | Link in Worker Portal |
@@ -331,6 +389,10 @@ curl -s http://localhost:3000/health | jq
 node server/scripts/postgres-diagnostic.js
 ```
 
+```bash
+curl -s http://localhost:3000/workforce/analytics | jq '.distribution, .departmentSummary'
+```
+
 Submit a demo request:
 
 ```bash
@@ -359,19 +421,20 @@ curl -X POST http://localhost:3000/events \
 1. Open Leadership View → **Actions** → create a **New request**.  
 2. Watch **Projects** as orchestration runs (plan → assign → schedule).  
 3. Open **Log** / **LLM Logs** for agent traces (with LLM keys).  
-4. Use **Help** (bottom-right) to ask about project status.  
-5. **Worker requests** tab — review human needs from the portal.  
+4. **Workforce** tab — inspect productivity matrix and at-risk workers.  
+5. **Help** (bottom-right) — ask about risk, workforce health, or open requests.  
+6. **Worker requests** tab — review human needs from the portal.  
 
 ### Worker path
 
 1. Open Worker Portal → log in as **Sam Lee** (`person-2`) or **Hermione Granger** (`person-5`, HR).  
-2. **Tasks** → mark work `done` → Leadership **Projects** shows `execution (human)` then `decision (project_ai)`.  
-3. Submit a **sick leave** request → log in as **Hermione** → **HR** → approve → employee unassigned and `on_leave`.  
-4. **Emergency return** — Hermione authorizes **Draco Malfoy** (`person-12`) for urgent work while leave remains on record.  
+2. **Tasks** tab → mark work `done` → Leadership shows `execution (human)` then `decision (project_ai)`.  
+3. Submit **sick leave** → Hermione → **HR** → approve → employee unassigned and `on_leave`.  
+4. **Emergency return** — Hermione authorizes **Draco Malfoy** (`person-12`) for urgent work.  
 
 ### Clear a blocker
 
-Assignee or Leadership: set task status to **In progress** or **Done** (not Blocked). The blocker line disappears on refresh.
+Assignee or Leadership: set task status to **In progress** or **Done**. Blocker clears on refresh.
 
 ---
 
@@ -387,9 +450,9 @@ Assignee or Leadership: set task status to **In progress** or **Done** (not Bloc
 
 | Role | Where | Actions |
 |------|--------|---------|
-| HR | Worker → **HR** | Approve, reject, in review, close; create HR tasks |
-| Project lead / eng mgmt | Worker → **Reviews** | Same for project-scoped requests |
-| Leadership | **Worker requests** tab | Approve / reject / close (no HR role required) |
+| HR | Worker → **HR** | Approve, reject, in review, close |
+| Project lead / eng mgmt | Worker → **Reviews** | Project-scoped requests |
+| Leadership | **Worker requests** tab | Approve / reject / close |
 
 ### Request statuses
 
@@ -415,26 +478,25 @@ Base URL: `http://localhost:3000` (also under `/api/…`).
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/events` | Submit event. `type: request` → orchestration. Human `execution` → Project AI reevaluation. |
-| `GET` | `/events` | Recent events (`?projectId=`) |
+| `POST` | `/events` | Submit event. `type: request` → orchestration. Activity triggers Project AI status check. |
+| `GET` | `/events` | Recent events (`?projectId=`, `?recentChanges=1`) |
 | `GET` | `/events/stream` | SSE live updates |
-| `GET` | `/events/projects` | All projects (on-leave assignees hidden on card) |
+| `GET` | `/events/projects` | All projects |
 | `GET` | `/events/projects/:id` | One project |
 | `GET` | `/events/agent-activity` | Agent log (`?projectId=`) |
 | `GET` | `/events/llm-logs` | LLM traces (`?projectId=`, `?agent=`) |
-| `GET` | `/events/needs` | Worker requests / needs (`?status=`) |
-| `PATCH` | `/events/needs/:id` | Update need: `open`, `in_review`, `approved`, `rejected`, `met`, `cancelled` |
+| `GET` | `/events/needs` | Worker requests (`?status=`) |
+| `PATCH` | `/events/needs/:id` | Update need status |
 | `POST` | `/events/worker/status` | Legacy task status path |
 
-**PATCH body example:** `{ "status": "approved", "reviewedBy": "leadership", "reviewNotes": "…" }`
-
-### Org insights & help
+### Org insights, workforce & help
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/org-insights` | Metrics + AI insights |
+| `GET` | `/org-insights` | Metrics + Org AI insights |
+| `GET` | `/workforce/analytics` | Productivity matrix & health indexes |
 | `GET` | `/help-chat/meta` | Suggested questions + agents |
-| `POST` | `/help-chat` | Leadership help chat (`message`, `agent`, `projectId`, `messages`) |
+| `POST` | `/help-chat` | Help chat (`message`, `agent`, `projectId`, `messages`) |
 
 ### Worker Portal (`/worker` and `/api/worker`)
 
@@ -442,28 +504,16 @@ Base URL: `http://localhost:3000` (also under `/api/…`).
 |--------|------|-------------|
 | `GET` | `/worker/people` | People for login (`?q=`) |
 | `GET` | `/worker/dashboard` | Home data (`?personId=`) |
-| `GET` | `/worker/meta` | Request kinds, handling modes, routing map |
+| `GET` | `/worker/meta` | Request kinds, handling modes, routing |
 | `POST` | `/worker/status` | Update own task status |
 | `POST` | `/worker/requests` | Submit worker request |
-| `PATCH` | `/worker/requests/:id` | HR / assigned reviewer updates status |
+| `PATCH` | `/worker/requests/:id` | HR / reviewer updates status |
 | `POST` | `/worker/requests/:id/tasks` | HR creates follow-up task |
 | `GET` | `/worker/hr/inbox` | HR queue (`?personId=`) |
 | `GET` | `/worker/project/inbox` | Project-scoped reviews (`?personId=`) |
-| `GET` | `/worker/hr/on-leave` | People on leave / emergency (`?personId=` HR) |
+| `GET` | `/worker/hr/on-leave` | People on leave / emergency |
 | `POST` | `/worker/hr/emergency-activate` | HR authorizes emergency work |
 | `POST` | `/worker/hr/emergency-end` | End emergency (`returnTo`: `leave` \| `active`) |
-
-**Emergency activate body:**
-
-```json
-{
-  "hrPersonId": "person-5",
-  "targetPersonId": "person-12",
-  "reason": "Production outage",
-  "projectId": "proj-school-website",
-  "taskId": "task-1"
-}
-```
 
 ### Health
 
@@ -481,48 +531,54 @@ Event schemas: [`docs/event-model.md`](docs/event-model.md).
 AI-Native-Organization-System/
 ├── .env.example
 ├── README.md
-├── package.json              # Root: pg, dotenv; npm start
+├── ProjectInsight.md           # Product vision & high-level overview
+├── package.json
 ├── docs/
+│   ├── principles.md
+│   ├── architecture.md
+│   ├── event-model.md
+│   └── orchestration-loop.md
 ├── prompts/
 │   ├── orchestrator.txt
 │   ├── teamBuilder.txt
 │   ├── scheduler.txt
-│   ├── projectAI.txt         # Project assessment after human execution
+│   ├── projectAI.txt           # Assessment + agentActions delegation
 │   ├── orgAI.txt
 │   └── helpChat.txt
-├── mock-data/
 ├── server/
 │   ├── index.js
 │   ├── constants/
 │   │   ├── workerRequests.js
-│   │   └── requestRouting.js # Per-kind role + AI agent routing
+│   │   └── requestRouting.js
 │   ├── routes/
 │   │   ├── events.js
 │   │   ├── worker.js
 │   │   ├── orgInsights.js
-│   │   └── helpChat.js
+│   │   ├── helpChat.js
+│   │   └── workforce.js
 │   ├── services/
 │   │   ├── orchestratorAI.js
 │   │   ├── teamBuilderAI.js
 │   │   ├── schedulerAI.js
-│   │   ├── projectAIEvaluator.js
+│   │   ├── projectAIEvaluator.js   # Status checks + polling
+│   │   ├── projectAIActions.js    # Delegate to other agents
+│   │   ├── assignmentGapFill.js
+│   │   ├── workforceAnalytics.js
+│   │   ├── helpChatContext.js
 │   │   ├── workerRequestHandler.js
 │   │   ├── workerRequestEffects.js
 │   │   ├── emergencyReturn.js
 │   │   └── metrics.js
-│   ├── lib/
-│   │   ├── llm.js
-│   │   ├── hrRouting.js          # Re-exports requestRouting
-│   │   ├── workerRequestLifecycle.js
-│   │   ├── personAvailability.js
-│   │   └── reconcileApprovedRequests.js
+│   ├── lib/llm.js
 │   ├── models/
 │   └── store/postgresStore.js
-├── client/                   # Leadership View
+├── client/                     # Leadership View
 │   ├── src/App.jsx
 │   ├── src/HelpChat.jsx
+│   ├── src/WorkforcePanel.jsx
 │   └── vite.config.js
-└── worker/                   # Worker Portal
+└── worker/                     # Worker Portal
+    ├── README.md
     ├── src/App.jsx
     └── vite.config.js
 ```
@@ -545,11 +601,12 @@ AI-Native-Organization-System/
 
 | Doc | Contents |
 |-----|----------|
+| [`ProjectInsight.md`](ProjectInsight.md) | Product vision, loop, MVP scope |
 | [`docs/principles.md`](docs/principles.md) | Product and ethics |
-| [`docs/architecture.md`](docs/architecture.md) | Components and loop |
+| [`docs/architecture.md`](docs/architecture.md) | Components and data flow |
 | [`docs/event-model.md`](docs/event-model.md) | Event types and state |
-| [`docs/orchestration-loop.md`](docs/orchestration-loop.md) | Orchestration pseudocode |
-| [`worker/README.md`](worker/README.md) | Worker app–only notes |
+| [`docs/orchestration-loop.md`](docs/orchestration-loop.md) | Orchestration + Project AI coordination |
+| [`worker/README.md`](worker/README.md) | Worker Portal setup and tabs |
 
 ---
 
@@ -561,27 +618,31 @@ Create `.env` in the **project root** and run `npm start` from the root.
 
 ### Worker login returns **Not Found**
 
-Restart the API after pulling changes — `/worker` routes must be loaded (`npm start` from root).
+Restart the API after pulling — `/worker` routes must be loaded (`npm start` from root).
+
+### Worker Portal white screen after login
+
+Refresh once; ensure API is running. Dashboard loads after `personId` is set.
 
 ### Worker request stuck; no HR inbox
 
-Check routing: workload / contribution on a project → **Reviews**, not HR. See `requiresHrInbox` in API responses.
+Workload / contribution on a project → **Reviews**, not HR. See routing in `GET /worker/meta`.
 
 ### Approved sick leave but person still on tasks
 
-Restart API once — reconciliation applies unassignment and leave notices for past approvals.
+Restart API once — reconciliation applies unassignment for past approvals.
 
 ### Project AI / help chat always stubbed
 
-Set `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or run Ollama. Check server logs for `[LLM]`.
+Set `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or Ollama Cloud (`LLM_PROVIDER=ollama`, `OLLAMA_API_KEY`). Check logs for `[LLM] Ollama Cloud`.
 
 ### Blocker will not clear
 
-Set task to **In progress** or **Done** via Worker Portal or Leadership **Actions** → execution event.
+Set task to **In progress** or **Done** via Worker Portal or Leadership **Actions**.
 
 ### `npm install` / `pg` not found
 
-Run `npm install` at the **repository root**, not only in `server/`.
+Run `npm install` at the **repository root**.
 
 ---
 
@@ -592,7 +653,8 @@ Run `npm install` at the **repository root**, not only in `server/`.
 - **Explainability** — rationales on agent and system events.  
 - **No silent decisions** — humans approve requests and decisions.  
 - **Leave is enforced** — emergency return is HR-gated and audited.  
-- **Ethics** — no surveillance; AI does not score human worth.
+- **Workforce indexes are operational signals**, not performance surveillance or HR scoring.  
+- **Ethics** — AI does not evaluate human worth.
 
 ---
 
@@ -601,11 +663,12 @@ Run `npm install` at the **repository root**, not only in `server/`.
 **MVP+** includes:
 
 - Event-driven orchestration and Postgres persistence  
-- Leadership View (overview, projects, actions, logs, LLM logs, worker requests, help chat)  
-- Worker Portal (tasks, routed requests, HR inbox, project reviews, emergency return)  
-- Worker request lifecycle (approve → side effects, unassignment, availability)  
-- Project AI reevaluation on human execution  
-- Org insights, SSE, themes  
+- Leadership View (overview, projects, workforce, actions, logs, LLM logs, worker requests, help chat)  
+- Worker Portal (overview, tasks, requests, HR inbox, project reviews, emergency return)  
+- Project AI status monitoring, periodic polls, and agent delegation  
+- Assignment gap fill, Org insights, workforce analytics, SSE, themes  
+- Help chat with full org + workforce context  
+- Ollama Cloud support with improved JSON parsing  
 
 **Not in MVP** — authentication, Slack/Jira/calendar integrations, email notifications.
 

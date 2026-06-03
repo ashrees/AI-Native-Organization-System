@@ -28,69 +28,195 @@ async function withModelLock(fn) {
   }
 }
 
+function stripTrailingCommas(jsonText) {
+  return jsonText.replace(/,(\s*[}\]])/g, '$1');
+}
+
+/** Close unclosed strings/brackets when the model hits num_predict mid-object. */
+function repairTruncatedJson(slice) {
+  let repaired = slice.trimEnd();
+  const stack = [];
+  let inString = false;
+  let escape = false;
+
+  for (let i = 0; i < repaired.length; i++) {
+    const c = repaired[i];
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c === '\\') {
+        escape = true;
+        continue;
+      }
+      if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      continue;
+    }
+    if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if ((c === '}' || c === ']') && stack.length && stack[stack.length - 1] === c) {
+      stack.pop();
+    }
+  }
+
+  if (inString) repaired += '"';
+  repaired = repaired.replace(/,\s*$/, '');
+  repaired = repaired.replace(/:\s*$/, ': null');
+  while (stack.length) repaired += stack.pop();
+  return repaired;
+}
+
+function tryParseJsonCandidate(candidate) {
+  if (!candidate) return null;
+  const cleaned = stripTrailingCommas(candidate.trim());
+  try {
+    return JSON.parse(cleaned);
+  } catch (_) {}
+  try {
+    return JSON.parse(repairTruncatedJson(cleaned));
+  } catch (_) {}
+  return null;
+}
+
 /** Parse JSON from LLM text; handles markdown code blocks, trailing text, trailing commas, and truncated JSON. */
 function parseJsonResponse(text) {
   if (!text || typeof text !== 'string') return null;
   let t = text.trim();
-  // Remove trailing commas before ] or } (invalid in strict JSON but some models output them)
-  t = t.replace(/,(\s*[}\]])/g, '$1');
-  try {
-    return JSON.parse(t);
-  } catch (_) {}
+  const direct = tryParseJsonCandidate(t);
+  if (direct !== null) return direct;
+
   const m = t.match(/```(?:json)?\s*([\s\S]*?)```/);
   if (m) {
-    try {
-      return JSON.parse(m[1].trim().replace(/,(\s*[}\]])/g, '$1'));
-    } catch (_) {}
+    const fromFence = tryParseJsonCandidate(m[1]);
+    if (fromFence !== null) return fromFence;
   }
+
   const i0 = t.indexOf('{');
   const i1 = t.indexOf('[');
-  const start = i1 >= 0 && (i0 < 0 || i1 <= i0) ? i1 : i0;
+  const start = i0 >= 0 && (i1 < 0 || i0 <= i1) ? i0 : i1;
   if (start < 0) return null;
-  const open = t[start];
-  const close = open === '[' ? ']' : '}';
-  let depth = 1;
-  let i = start + 1;
-  while (i < t.length && depth > 0) {
+
+  const stack = [];
+  let inString = false;
+  let escape = false;
+  let closedAt = -1;
+
+  for (let i = start; i < t.length; i++) {
     const c = t[i];
-    if (c === '"') {
-      i++;
-      while (i < t.length && (t[i] !== '"' || t[i - 1] === '\\')) i++;
-      i++;
+    if (inString) {
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c === '\\') {
+        escape = true;
+        continue;
+      }
+      if (c === '"') inString = false;
       continue;
     }
-    if (c === close) depth--;
-    else if (c === open) depth++;
-    i++;
-  }
-  let slice = t.slice(start, i);
-  if (depth !== 0) {
-    // Truncated: try appending closing brackets to get valid JSON
-    const toTry = [
-      slice + '}]}',   // {"tasks": [{"id": "1"  ->  {"tasks": [{"id": "1"}]}
-      slice + ']}',    // {"tasks": [  ->  {"tasks": []}
-      slice + ']} }',  // {"tasks": [...]  ->  {"tasks": []} (extra } safe if already closed)
-      slice + '}',
-      slice + ']',
-    ];
-    for (const s of toTry) {
-      try {
-        return JSON.parse(s.replace(/,(\s*[}\]])/g, '$1'));
-      } catch (_) {}
+    if (c === '"') {
+      inString = true;
+      continue;
     }
-    return null;
+    if (c === '{') stack.push('}');
+    else if (c === '[') stack.push(']');
+    else if ((c === '}' || c === ']') && stack.length && stack[stack.length - 1] === c) {
+      stack.pop();
+      if (stack.length === 0) {
+        closedAt = i + 1;
+        break;
+      }
+    }
   }
-  try {
-    const parsed = JSON.parse(slice.replace(/,(\s*[}\]])/g, '$1'));
-    return parsed;
-  } catch (_) {
-    return null;
-  }
+
+  const slice = closedAt > 0 ? t.slice(start, closedAt) : t.slice(start);
+  return tryParseJsonCandidate(slice);
 }
 
 function cleanEnvValue(value) {
   if (value == null) return '';
   return String(value).replace(/\s+#.*$/, '').trim();
+}
+
+/** Default free-tier cloud models (direct API at ollama.com). See https://docs.ollama.com/cloud */
+const OLLAMA_CLOUD_DEFAULT_MODELS = 'gpt-oss:120b,nemotron-3-super,gpt-oss:20b';
+const OLLAMA_LOCAL_CLOUD_PROXY_MODELS = 'gpt-oss:120b-cloud,nemotron-3-super:cloud,gpt-oss:20b-cloud';
+
+/**
+ * Resolve Ollama host, auth, and model names.
+ * - Direct cloud: OLLAMA_API_KEY + https://ollama.com (models without -cloud suffix)
+ * - Local app proxy: localhost:11434 after `ollama signin` + `ollama pull …-cloud`
+ */
+function getOllamaConfig(options = {}) {
+  const apiKey = cleanEnvValue(process.env.OLLAMA_API_KEY);
+  const useCloudApi = !!apiKey;
+  const baseUrl = cleanEnvValue(
+    options.baseUrl ||
+      process.env.OLLAMA_BASE_URL ||
+      (useCloudApi ? 'https://ollama.com' : 'http://localhost:11434')
+  ).replace(/\/$/, '');
+  const isDirectCloud = useCloudApi || baseUrl.includes('ollama.com');
+
+  const modelSpec = cleanEnvValue(
+    options.model ||
+      process.env.OLLAMA_MODEL ||
+      (isDirectCloud && !baseUrl.includes('localhost') ? OLLAMA_CLOUD_DEFAULT_MODELS : OLLAMA_LOCAL_CLOUD_PROXY_MODELS)
+  );
+
+  const modelCandidates = modelSpec
+    .split(',')
+    .map((s) => cleanEnvValue(s))
+    .filter(Boolean)
+    .map((name) => {
+      if (isDirectCloud && name.endsWith('-cloud')) {
+        return name.replace(/-cloud$/i, '');
+      }
+      const cloudApiNames = OLLAMA_CLOUD_DEFAULT_MODELS.split(',');
+      if (
+        !isDirectCloud &&
+        baseUrl.includes('localhost') &&
+        !name.endsWith('-cloud') &&
+        !name.includes(':cloud') &&
+        cloudApiNames.includes(name)
+      ) {
+        return `${name}-cloud`;
+      }
+      return name;
+    });
+
+  return {
+    baseUrl,
+    apiKey,
+    isDirectCloud,
+    modelCandidates: modelCandidates.length ? modelCandidates : ['gpt-oss:120b'],
+    label: isDirectCloud ? 'Ollama Cloud' : 'Ollama (local)',
+  };
+}
+
+async function ollamaChatRequest(baseUrl, apiKey, body, timeoutMs) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (apiKey) {
+    headers.Authorization = `Bearer ${apiKey}`;
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`${baseUrl}/api/chat`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    return res;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 /** Max retries when LLM returns null; we wait for a proper response. */
@@ -204,6 +330,46 @@ const OLLAMA_TOOLS = Object.freeze({
       },
     },
   ],
+  projectAI: [
+    {
+      type: 'function',
+      function: {
+        name: 'submit_project_assessment',
+        description: 'Submit project status assessment and optional agent delegations.',
+        parameters: {
+          type: 'object',
+          required: ['summary', 'riskLevel', 'riskReason'],
+          properties: {
+            summary: { type: 'string', description: 'Two sentence project status summary' },
+            riskLevel: { type: 'string', enum: ['low', 'medium', 'high'] },
+            riskReason: { type: 'string', description: 'One line risk explanation' },
+            recentChanges: {
+              type: 'array',
+              items: { type: 'string' },
+            },
+            suggestProjectCompleted: { type: 'boolean' },
+            agentActions: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  agent: { type: 'string', enum: ['orchestrator', 'team_builder', 'scheduler', 'system'] },
+                  action: {
+                    type: 'string',
+                    enum: ['assign_unassigned', 'assign_task', 'reschedule', 'replan', 'create_need'],
+                  },
+                  reason: { type: 'string' },
+                  taskId: { type: 'string' },
+                  taskIds: { type: 'array', items: { type: 'string' } },
+                  payload: { type: 'object' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  ],
 });
 
 /**
@@ -249,36 +415,30 @@ async function completeWithGoogle(systemPrompt, userMessage, options = {}) {
  * Returns parsed JSON object, or null if not configured or on error.
  */
 async function completeWithOllama(systemPrompt, userMessage, options = {}) {
-  const baseUrl = cleanEnvValue(process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/$/, '');
-  const modelSpec = cleanEnvValue(options.model || process.env.OLLAMA_MODEL || 'llama3.1:8b');
-  const modelCandidates = modelSpec
-    .split(',')
-    .map((s) => cleanEnvValue(s))
-    .filter(Boolean);
-
+  const { baseUrl, apiKey, isDirectCloud, modelCandidates, label } = getOllamaConfig(options);
   const tools = options.tools != null && Array.isArray(options.tools) && options.tools.length > 0 ? options.tools : null;
 
   try {
-    // Use caller timeout or env; enforce minimum 2 min for Ollama so we wait for the model to finish.
     const requested = Number(
       cleanEnvValue(
         options.timeoutMs != null ? String(options.timeoutMs) : process.env.OLLAMA_TIMEOUT_MS
       ) || 60000
     );
-    const timeoutMs = Math.max(requested, 120000);
+    const timeoutMs = Math.max(requested, isDirectCloud ? 180000 : 120000);
 
-    const candidates = (modelCandidates.length ? modelCandidates : ['llama3.1:8b']).slice();
-    // Prefer non-"thinking" models first for responsiveness.
+    const candidates = modelCandidates.slice();
     candidates.sort((a, b) => {
       const ax = a.toLowerCase().includes('thinking') ? 1 : 0;
       const bx = b.toLowerCase().includes('thinking') ? 1 : 0;
       return ax - bx;
     });
 
+    if (candidates.length) {
+      console.log(`[LLM] ${label} models: ${candidates.join(', ')}`);
+    }
+
     for (let idx = 0; idx < candidates.length; idx++) {
       const model = candidates[idx];
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
       try {
         const body = {
@@ -290,32 +450,33 @@ async function completeWithOllama(systemPrompt, userMessage, options = {}) {
           stream: false,
           options: {
             temperature: 0.2,
-            num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 2048),
+            num_predict: Number(
+              process.env.OLLAMA_NUM_PREDICT ||
+                (isDirectCloud ? 8192 : 2048)
+            ),
           },
         };
-        // Use tool calling when tools provided (structured output); otherwise request format: json
         if (tools) {
           body.tools = tools;
         } else {
           body.format = 'json';
         }
 
-        const res = await fetch(`${baseUrl}/api/chat`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        const res = await ollamaChatRequest(baseUrl, apiKey, body, timeoutMs);
 
         if (!res.ok) {
           const bodyText = await res.text().catch(() => '');
-          // If model name is wrong, try the next candidate.
+          if (res.status === 401 || res.status === 403) {
+            console.error(
+              '[LLM] Ollama Cloud auth failed. Set OLLAMA_API_KEY from https://ollama.com/settings/keys'
+            );
+            return null;
+          }
           if (res.status === 404 || /model .* not found/i.test(bodyText)) {
             console.warn(`[LLM] Ollama model not found: ${model}`);
             continue;
           }
-          // If a model is unstable (500), try the next candidate (if any).
-          if (res.status >= 500 && modelCandidates.length > 1) {
+          if (res.status >= 500 && candidates.length > 1) {
             console.warn(`[LLM] Ollama model failed (${res.status}) for ${model}; trying next model candidate`);
             continue;
           }
@@ -348,7 +509,13 @@ async function completeWithOllama(systemPrompt, userMessage, options = {}) {
         try {
           return JSON.parse(text);
         } catch (_) {}
-        console.warn(`[LLM] Ollama response did not parse as JSON (model may have returned prose). First 200 chars: ${String(text).slice(0, 200)}`);
+        const preview = String(text).slice(0, 200);
+        const likelyTruncated = text.length > 500 && text.trimStart().startsWith('{');
+        console.warn(
+          `[LLM] Ollama response did not parse as JSON${
+            likelyTruncated ? ' (likely truncated — raise OLLAMA_NUM_PREDICT)' : ''
+          }. First 200 chars: ${preview}`
+        );
         return null;
       } catch (err) {
         if (err.name === 'AbortError') {
@@ -359,15 +526,12 @@ async function completeWithOllama(systemPrompt, userMessage, options = {}) {
           console.error('Ollama complete error: request timed out');
           return null;
         }
-        // If the server is unreachable, other candidates will likely fail too, but trying is cheap.
         if (idx < candidates.length - 1) {
           console.warn(`[LLM] Ollama request failed for ${model}: ${err.message}; trying next model candidate`);
           continue;
         }
         console.error('Ollama complete error:', err.message);
         return null;
-      } finally {
-        clearTimeout(timeout);
       }
     }
 
@@ -432,7 +596,7 @@ async function complete(systemPrompt, userMessage, options = {}) {
         return completeWithOpenAI(systemPrompt, userMessage, options);
       }
       if (providerPref === 'ollama') {
-        console.log('[LLM] Provider preference: Ollama (local)');
+        console.log(`[LLM] Provider preference: ${getOllamaConfig(options).label}`);
         return completeWithOllama(systemPrompt, userMessage, options);
       }
       const useGoogle = !!cleanEnvValue(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY);
@@ -446,8 +610,11 @@ async function complete(systemPrompt, userMessage, options = {}) {
         const r = await completeWithOpenAI(systemPrompt, userMessage, options);
         if (r !== null) return r;
       }
-      console.log('[LLM] Using Ollama (auto, local) if available');
-      return completeWithOllama(systemPrompt, userMessage, options);
+      const ollamaCfg = getOllamaConfig(options);
+      console.log(`[LLM] Using ${ollamaCfg.label} (auto)`);
+      const r = await completeWithOllama(systemPrompt, userMessage, options);
+      if (r !== null) return r;
+      return null;
     }
 
     let lastLog = '';
@@ -506,36 +673,31 @@ function buildChatMessages(systemPrompt, userMessage, options = {}) {
 }
 
 async function completeTextWithOllama(systemPrompt, userMessage, options = {}) {
-  const baseUrl = cleanEnvValue(process.env.OLLAMA_BASE_URL || 'http://localhost:11434').replace(/\/$/, '');
-  const modelSpec = cleanEnvValue(options.model || process.env.OLLAMA_MODEL || 'llama3.1:8b');
-  const modelCandidates = modelSpec.split(',').map((s) => cleanEnvValue(s)).filter(Boolean);
-  const timeoutMs = options.timeoutMs ?? 90000;
+  const { baseUrl, apiKey, modelCandidates } = getOllamaConfig(options);
+  const timeoutMs = options.timeoutMs ?? (apiKey ? 120000 : 90000);
   const messages = buildChatMessages(systemPrompt, userMessage, options);
 
-  for (const model of modelCandidates) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  for (let i = 0; i < modelCandidates.length; i++) {
+    const model = modelCandidates[i];
     try {
-      const res = await fetch(`${baseUrl}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const res = await ollamaChatRequest(
+        baseUrl,
+        apiKey,
+        {
           model,
           messages,
           stream: false,
           options: { temperature: 0.3, num_predict: Number(process.env.OLLAMA_NUM_PREDICT || 2048) },
-        }),
-        signal: controller.signal,
-      });
+        },
+        timeoutMs
+      );
       if (!res.ok) continue;
       const data = await res.json();
       const text = data?.message?.content;
       if (text && typeof text === 'string' && text.trim()) return text.trim();
     } catch (err) {
-      if (modelCandidates.indexOf(model) < modelCandidates.length - 1) continue;
+      if (i < modelCandidates.length - 1) continue;
       console.error('Ollama completeText error:', err.message);
-    } finally {
-      clearTimeout(timeout);
     }
   }
   return null;

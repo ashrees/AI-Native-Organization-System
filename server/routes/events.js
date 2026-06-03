@@ -15,7 +15,11 @@ const orchestratorAI = require('../services/orchestratorAI');
 const teamBuilderAI = require('../services/teamBuilderAI');
 const schedulerAI = require('../services/schedulerAI');
 const agentActivityLog = require('../lib/agentActivityLog');
-const { scheduleProjectAIReevaluation } = require('../services/projectAIEvaluator');
+const { scheduleProjectStatusCheck, startProjectAIStatusPolling, shouldScheduleStatusCheck } = require('../services/projectAIEvaluator');
+const {
+  shouldRequestAssignmentGapFill,
+  scheduleAssignmentGapFill,
+} = require('../services/assignmentGapFill');
 const { buildAllProjectMetrics } = require('../services/metrics');
 const { buildAgentContext } = require('../services/retrieval');
 const postgresStore = require('../store/postgresStore');
@@ -88,6 +92,8 @@ async function initStore() {
   } catch (err) {
     console.warn('[Store] Approved request reconciliation skipped:', err.message);
   }
+
+  startProjectAIStatusPolling(buildProjectAICtx());
 }
 
 /**
@@ -132,6 +138,37 @@ function agentLogMessage(text, maxSentences = 2) {
   return taken.endsWith('.') || taken.endsWith('!') || taken.endsWith('?') ? taken : `${taken}.`;
 }
 
+/** Human-readable line for execution events in Leadership "What changed recently". */
+function humanExecutionRationale(projectState, payload, opts = {}) {
+  const { taskId, status, notes } = payload || {};
+  const task = taskId && projectState ? findTask(projectState, taskId) : null;
+  const title = task?.title || taskId || 'task';
+  const statusLabel = String(status || 'updated').replace(/_/g, ' ');
+  const who = opts.personName ? `${opts.personName} — ` : '';
+  let msg = `${who}Task "${title}" marked ${statusLabel}`;
+  if (notes && String(notes).trim()) msg += `: ${String(notes).trim()}`;
+  return agentLogMessage(msg) || msg;
+}
+
+function enrichEventRationale(event) {
+  if (!event || event.rationale) return event;
+  const state = projects[event.projectId];
+  if (event.type === 'execution' && event.source === 'human') {
+    const personId = event.payload?.personId;
+    const person = personId ? peopleCache.find((p) => p.id === personId) : null;
+    event.rationale = humanExecutionRationale(state, event.payload, {
+      personName: person?.name,
+    });
+  } else if (event.type === 'decision' && event.source === 'human') {
+    const dt = event.payload?.decisionType || 'decision';
+    const reason = event.payload?.reason;
+    event.rationale =
+      agentLogMessage(reason) ||
+      `Human decision: ${String(dt).replace(/_/g, ' ')}`;
+  }
+  return event;
+}
+
 /**
  * Apply event to project state and persist.
  * All mutations to project state go through here (per event-model invariants).
@@ -173,6 +210,10 @@ async function emitEvent(event) {
   eventLog.push(event);
   await applyAndPersist(event);
   sseBroadcast('event', { id: event.id, type: event.type, projectId: event.projectId, timestamp: event.timestamp });
+
+  if (shouldScheduleStatusCheck(event)) {
+    scheduleProjectStatusCheck(event.projectId, event, buildProjectAICtx());
+  }
 }
 
 /**
@@ -407,6 +448,7 @@ router.post('/', async (req, res) => {
     return res.status(200).json({ accepted: true, id: event.id, duplicate: true });
   }
 
+  enrichEventRationale(event);
   eventLog.push(event);
   await applyAndPersist(event);
   sseBroadcast('event', { id: event.id, type: event.type, projectId: event.projectId, timestamp: event.timestamp });
@@ -423,7 +465,11 @@ router.post('/', async (req, res) => {
   }
 
   if (event.type === 'execution' && event.source === 'human') {
-    afterHumanExecution(event);
+    scheduleProjectStatusCheck(event.projectId, event, buildProjectAICtx());
+    const stateAfterExec = projects[event.projectId];
+    if (stateAfterExec && shouldRequestAssignmentGapFill(event, stateAfterExec)) {
+      scheduleAssignmentGapFill(event.projectId, event, buildAssignmentGapFillCtx());
+    }
   }
 
   // Optional replan: on blocker or reprioritize, emit a system request and run orchestration once
@@ -519,10 +565,12 @@ async function submitWorkerStatus(body) {
     payload: {
       taskId,
       status,
+      personId,
       notes: notes != null && String(notes).trim() !== '' ? String(notes).trim() : undefined,
     },
   };
 
+  enrichEventRationale(event);
   eventLog.push(event);
   await applyAndPersist(event);
   sseBroadcast('event', { id: event.id, type: event.type, projectId, timestamp: event.timestamp });
@@ -533,7 +581,7 @@ async function submitWorkerStatus(body) {
   }
 
   const projectStateAfter = projects[projectId];
-  afterHumanExecution(event);
+  scheduleProjectStatusCheck(projectId, event, buildProjectAICtx());
 
   if (projectStateAfter && projectStateAfter.status === 'active' && status === 'blocked') {
     const replanRequest = {
@@ -597,12 +645,21 @@ router.get('/stream', (req, res) => {
  * GET /events — list recent events (debug). Optional ?projectId= to filter.
  */
 router.get('/', (req, res) => {
-  const { projectId } = req.query;
+  const { projectId, limit: limitParam, recentChanges } = req.query;
   let list = eventLog;
   if (projectId) {
-    list = eventLog.filter((e) => e.projectId === projectId);
+    list = list.filter((e) => e.projectId === projectId);
   }
-  res.json({ events: list.slice(-100) });
+  if (recentChanges === '1' || recentChanges === 'true') {
+    list = list.filter((e) =>
+      ['execution', 'decision', 'unassignment'].includes(e.type)
+    );
+  }
+  const cap = Math.min(Math.max(parseInt(String(limitParam || ''), 10) || 200, 1), 500);
+  const recent = list
+    .slice(-cap)
+    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  res.json({ events: recent });
 });
 
 /**
@@ -825,11 +882,23 @@ function buildProjectAICtx() {
     emitEvent,
     loadPeople,
     getStore: () => ({ eventLog, projects }),
+    handleRequestFlow,
+    buildAssignmentGapFillCtx,
+    agentLogMessage,
   };
 }
 
-function afterHumanExecution(event) {
-  scheduleProjectAIReevaluation(event.projectId, event, buildProjectAICtx());
+function buildAssignmentGapFillCtx() {
+  return {
+    emitEvent,
+    getStore: () => ({ eventLog, projects }),
+    loadPeople,
+    incrementPersonLoad: async (personId) => {
+      await postgresStore.incrementPersonLoad(personId);
+      peopleCache = await postgresStore.loadAllPeople();
+    },
+    agentLogMessage,
+  };
 }
 
 router.initStore = initStore;

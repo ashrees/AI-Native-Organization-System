@@ -20,6 +20,7 @@ const eventsRouter = require('./routes/events');
 const workerRouter = require('./routes/worker');
 const orgInsightsRouter = require('./routes/orgInsights');
 const helpChatRouter = require('./routes/helpChat');
+const workforceRouter = require('./routes/workforce');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -41,6 +42,9 @@ app.use('/api/org-insights', orgInsightsRouter);
 
 app.use('/help-chat', helpChatRouter);
 app.use('/api/help-chat', helpChatRouter);
+
+app.use('/workforce', workforceRouter);
+app.use('/api/workforce', workforceRouter);
 
 // Health/debug
 const healthPayload = () => ({

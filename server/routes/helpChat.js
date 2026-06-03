@@ -9,9 +9,7 @@ const express = require('express');
 const router = express.Router();
 
 const { readPrompt, completeText } = require('../lib/llm');
-const { buildAllProjectMetrics } = require('../services/metrics');
-const { buildAgentContext, getProjectTimeline } = require('../services/retrieval');
-const agentActivityLog = require('../lib/agentActivityLog');
+const { buildFullHelpContext } = require('../services/helpChatContext');
 
 const AGENTS = Object.freeze({
   org_ai: { label: 'Org AI', description: 'Organization-wide status, risk, and insights' },
@@ -24,10 +22,11 @@ const AGENTS = Object.freeze({
 
 const SUGGESTED_QUESTIONS = [
   'Which projects are at highest risk right now?',
+  'Who is at risk on the workforce health matrix and why?',
+  'Which departments have the best productivity scores?',
   'Summarize open worker requests and who they were forwarded to.',
   'Who has the most blocked or in-progress tasks?',
   'What did AI agents do recently across the org?',
-  'Which projects have blockers and what are they?',
 ];
 
 function loadStore() {
@@ -53,116 +52,82 @@ function pickAgent(message, projectId) {
     return 'project_ai';
   }
   if (/schedule|timeline|deadline/.test(q)) return 'scheduler';
+  if (/workforce|productivity|health score|engagement|reliability|thriving|at.risk|matrix|status band|overloaded|underutilized/.test(q)) {
+    return 'org_ai';
+  }
   if (/assign|who is|people|workload|hr\b|worker request|leave|vacation/.test(q)) return 'team_builder';
   if (/project|blocker|task|risk|plan|delivery/.test(q)) return 'orchestrator';
   return 'org_ai';
 }
 
-function compactWorkerRequests(events, limit = 15) {
-  return events
-    .filter((e) => e.type === 'need' && e.source === 'human' && e.payload?.title)
-    .slice(-limit)
-    .reverse()
-    .map((e) => ({
-      id: e.id,
-      projectId: e.projectId,
-      kind: e.payload.kind,
-      title: e.payload.title,
-      status: e.payload.status || 'open',
-      handlingMode: e.payload.handlingMode,
-      forwardsTo: e.payload.forwardsTo || e.payload.routingLabel,
-      forwardTargets: (e.payload.forwardTargets || e.payload.notifyTargets || []).map((t) => ({
-        name: t.name,
-        role: t.roleLabel || t.role,
-      })),
-      timestamp: e.timestamp,
-    }));
-}
-
-function buildHelpContext(agent, projectId, store, orgInsights) {
-  const { events, projects, people } = store;
-  const metrics = buildAllProjectMetrics(projects, events);
-
-  const projectSummaries = (metrics.projects || []).map((m) => ({
-    projectId: m.projectId,
-    title: m.title,
-    status: m.status,
-    riskLevel: m.risk?.level,
-    riskReasons: (m.risk?.reasons || []).slice(0, 3),
-    tasks: m.tasks,
-    blockers: m.blockers?.count ?? 0,
-    lastEventAgeHours: m.timeline?.lastEventAgeHours,
-  }));
-
-  const agentContext = buildAgentContext(agent, projectId || null, { focus: 'help_chat' }, {
-    eventLog: events,
-    projects,
-    people,
-    metrics,
-  });
-
-  if (projectId) {
-    agentContext.projectTimeline = getProjectTimeline(projectId, events, { limit: 12 });
-    const state = projects[projectId];
-    if (state?.blockers?.length) {
-      agentContext.openBlockers = state.blockers.slice(0, 8);
-    }
-  }
-
-  return {
-    agent,
-    projectId: projectId || null,
-    generatedAt: new Date().toISOString(),
-    projectSummaries,
-    workerRequests: compactWorkerRequests(events),
-    recentAgentActivity: agentActivityLog.getRecent(projectId ? { projectId } : {}).slice(0, 15),
-    peopleDirectory: (people || []).slice(0, 40).map((p) => ({
-      id: p.id,
-      name: p.name,
-      department: p.department,
-      team: p.team,
-      role: p.role,
-      currentLoad: p.currentLoad,
-    })),
-    orgInsights: orgInsights || null,
-    agentContext,
-  };
-}
+const buildHelpContext = buildFullHelpContext;
 
 function buildFallbackAnswer(message, context) {
   const lines = [
     '**Live data summary** (LLM unavailable — configure `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or Ollama):',
     '',
   ];
-  const atRisk = (context.projectSummaries || []).filter(
-    (p) => p.riskLevel === 'high' || p.riskLevel === 'medium' || (p.blockers || 0) > 0
+  const cov = context.dataCoverage || {};
+  lines.push(
+    `Coverage: ${cov.projects ?? 0} projects, ${cov.people ?? 0} people, ${cov.workforceWorkers ?? 0} workforce profiles, ${cov.eventsIncluded ?? 0}/${cov.eventsTotalInStore ?? 0} events, ${cov.openWorkerRequests ?? 0} open worker requests.`
+  );
+  lines.push('');
+
+  const atRisk = (context.metrics?.projects || []).filter(
+    (p) => p.risk?.level === 'high' || p.risk?.level === 'medium' || (p.blockers?.count || 0) > 0
   );
   if (atRisk.length) {
     lines.push('**Projects needing attention:**');
-    for (const p of atRisk.slice(0, 6)) {
+    for (const p of atRisk.slice(0, 8)) {
       lines.push(
-        `- **${p.title || p.projectId}** — risk ${p.riskLevel || 'unknown'}, ${p.tasks?.blocked || 0} blocked, ${p.tasks?.in_progress || 0} in progress`
+        `- **${p.title || p.projectId}** — risk ${p.risk?.level || 'unknown'}, ${p.tasks?.blocked || 0} blocked, ${p.tasks?.in_progress || 0} in progress`
       );
     }
     lines.push('');
-  } else {
-    lines.push('No high-risk projects flagged in current metrics.');
+  }
+
+  const unassigned = context.unassignedTasks || [];
+  if (unassigned.length) {
+    lines.push(`**Unassigned tasks:** ${unassigned.length}`);
+    for (const t of unassigned.slice(0, 6)) {
+      lines.push(`- ${t.projectTitle}: ${t.taskTitle || t.taskId}`);
+    }
     lines.push('');
   }
 
-  const wr = context.workerRequests || [];
-  const openWr = wr.filter((r) => ['open', 'in_review'].includes(r.status));
-  lines.push(`**Worker requests:** ${openWr.length} open of ${wr.length} recent.`);
-  for (const r of openWr.slice(0, 5)) {
+  const openWr = context.openWorkerRequests || [];
+  lines.push(`**Worker requests:** ${openWr.length} open of ${(context.workerRequests || []).length} total.`);
+  for (const r of openWr.slice(0, 8)) {
     const fwd = (r.forwardTargets || []).map((t) => t.name).filter(Boolean).join(', ');
     lines.push(`- ${r.kind}: ${r.title}${fwd ? ` → ${fwd}` : ''}`);
   }
   lines.push('');
 
+  const wf = context.workforce;
+  if (wf?.workers?.length) {
+    const dist = wf.distribution || {};
+    lines.push(
+      `**Workforce:** ${wf.workers.length} profiles — ${dist.thriving ?? 0} thriving, ${dist.steady ?? 0} steady, ${dist.watch ?? 0} watch, ${dist.at_risk ?? 0} at risk.`
+    );
+    for (const w of (wf.highlights?.atRisk || []).slice(0, 5)) {
+      lines.push(
+        `- **${w.name}** — overall ${w.indexes?.overall ?? '?'}, health ${w.indexes?.health ?? '?'}${w.signals?.length ? ` (${w.signals.join('; ')})` : ''}`
+      );
+    }
+    if (wf.departmentSummary?.length) {
+      lines.push('');
+      lines.push('**Departments (avg overall):**');
+      for (const d of wf.departmentSummary.slice(0, 6)) {
+        lines.push(`- ${d.department}: ${d.avgOverall} (${d.headcount} people)`);
+      }
+    }
+    lines.push('');
+  }
+
   const activity = context.recentAgentActivity || [];
   if (activity.length) {
     lines.push('**Recent AI activity:**');
-    for (const a of activity.slice(0, 5)) {
+    for (const a of activity.slice(0, 6)) {
       lines.push(`- [${a.source}] ${a.message}`);
     }
   }
@@ -219,7 +184,10 @@ router.post('/', async (req, res) => {
   const context = buildHelpContext(agent, projectId, store, orgInsights);
   const systemPrompt = readPrompt('helpChat') || 'Answer using only the provided JSON context.';
   const agentNote = `You are answering as the **${AGENTS[agent]?.label || agent}** agent.`;
-  const userPayload = `${agentNote}\n\nContext JSON:\n${JSON.stringify(context)}\n\nUser question:\n${message}`;
+  const coverage = context.dataCoverage
+    ? `Data coverage: ${JSON.stringify(context.dataCoverage)}`
+    : '';
+  const userPayload = `${agentNote}\n${coverage}\n\nContext JSON:\n${JSON.stringify(context)}\n\nUser question:\n${message}`;
 
   const answer = await completeText(systemPrompt, userPayload, {
     agent: `help_${agent}`,

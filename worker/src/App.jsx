@@ -145,12 +145,26 @@ function LoginScreen({ onLogin }) {
   );
 }
 
-function StatCard({ label, value, tone }) {
+/** Overview: task summary only — status updates live on the Tasks tab. */
+function TaskPreviewCard({ task, onOpenTasks }) {
+  const status = task.status || 'pending';
   return (
-    <div className={`worker-stat worker-stat--${tone || 'default'}`}>
-      <span className="worker-stat-value">{value}</span>
-      <span className="worker-stat-label">{label}</span>
-    </div>
+    <article className={`worker-task worker-task--preview worker-task--${status}`}>
+      <header className="worker-task-head">
+        <h3>{task.title}</h3>
+        <span className={`worker-pill worker-pill--status-${status}`}>{statusLabel(status)}</span>
+      </header>
+      <p className="worker-task-project">{task.projectTitle}</p>
+      {task.description && <p className="worker-task-desc">{task.description}</p>}
+      {(task.scheduledStart || task.scheduledEnd) && (
+        <p className="worker-task-schedule">
+          {formatDate(task.scheduledStart)} — {formatDate(task.scheduledEnd)}
+        </p>
+      )}
+      <button type="button" className="worker-btn worker-btn--secondary worker-btn--sm" onClick={onOpenTasks}>
+        Update status in Tasks →
+      </button>
+    </article>
   );
 }
 
@@ -199,7 +213,7 @@ function TaskCard({ task, personId, onUpdated }) {
         </p>
       )}
       <p className="worker-task-current">
-        Status: <strong>{statusLabel(status)}</strong>
+        Current: <span className={`worker-pill worker-pill--status-${status}`}>{statusLabel(status)}</span>
       </p>
       <label className="worker-label worker-label--inline">
         Notes (optional)
@@ -210,14 +224,29 @@ function TaskCard({ task, personId, onUpdated }) {
           placeholder={status === 'blocked' ? 'What is blocking you?' : 'Update notes'}
         />
       </label>
-      <div className="worker-task-actions">
-        <button type="button" disabled={saving} onClick={() => submitStatus('in_progress')}>
+      <div className="worker-btn-group" role="group" aria-label="Update task status">
+        <button
+          type="button"
+          className={`worker-btn worker-btn--secondary ${status === 'in_progress' ? 'is-active' : ''}`}
+          disabled={saving}
+          onClick={() => submitStatus('in_progress')}
+        >
           In progress
         </button>
-        <button type="button" disabled={saving} onClick={() => submitStatus('done')}>
+        <button
+          type="button"
+          className={`worker-btn worker-btn--success ${status === 'done' ? 'is-active' : ''}`}
+          disabled={saving}
+          onClick={() => submitStatus('done')}
+        >
           Done
         </button>
-        <button type="button" className="worker-btn-warn" disabled={saving} onClick={() => submitStatus('blocked')}>
+        <button
+          type="button"
+          className={`worker-btn worker-btn--danger ${status === 'blocked' ? 'is-active' : ''}`}
+          disabled={saving}
+          onClick={() => submitStatus('blocked')}
+        >
           Blocked
         </button>
       </div>
@@ -361,7 +390,7 @@ function RequestForm({ dashboard, personId, onSubmitted }) {
           <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
         </label>
       </div>
-      <button type="submit" className="worker-btn-primary">Submit request</button>
+      <button type="submit" className="worker-btn worker-btn--primary">Submit request</button>
       {status === 'ok' && (
         <p className="worker-ok">
           Request submitted ({HANDLING_LABELS[handlingMode] || handlingMode}). Routed to:{' '}
@@ -447,13 +476,19 @@ function RequestReviewActions({ requestId, personId, notes, setNotes, onDone, ms
           placeholder="Decision or next steps for the employee"
         />
       </label>
-      <div className="worker-task-actions">
-        <button type="button" onClick={() => review('in_review')}>Mark in review</button>
-        <button type="button" onClick={() => review('approved')}>Approve</button>
-        <button type="button" className="worker-btn-warn" onClick={() => review('rejected')}>
+      <div className="worker-btn-group worker-btn-group--wrap">
+        <button type="button" className="worker-btn worker-btn--secondary" onClick={() => review('in_review')}>
+          In review
+        </button>
+        <button type="button" className="worker-btn worker-btn--success" onClick={() => review('approved')}>
+          Approve
+        </button>
+        <button type="button" className="worker-btn worker-btn--danger" onClick={() => review('rejected')}>
           Reject
         </button>
-        <button type="button" onClick={() => review('met')}>Close (resolved)</button>
+        <button type="button" className="worker-btn worker-btn--ghost" onClick={() => review('met')}>
+          Close
+        </button>
       </div>
     </>
   );
@@ -607,7 +642,7 @@ function HrEmergencyPanel({ personId, onUpdated }) {
               placeholder="task-12"
             />
           </label>
-          <button type="button" className="worker-btn-primary" onClick={() => activate(p.id)}>
+          <button type="button" className="worker-btn worker-btn--primary" onClick={() => activate(p.id)}>
             Authorize emergency work
           </button>
         </div>
@@ -616,12 +651,12 @@ function HrEmergencyPanel({ personId, onUpdated }) {
         <div key={p.id} className="worker-hr-emergency-card worker-hr-emergency-card--active">
           <strong>{p.name}</strong>
           <span className="worker-muted"> — emergency work active</span>
-          <div className="worker-task-actions">
-            <button type="button" onClick={() => endEmergency(p.id, 'leave')}>
-              End emergency → back on leave
+          <div className="worker-btn-group worker-btn-group--wrap">
+            <button type="button" className="worker-btn worker-btn--secondary" onClick={() => endEmergency(p.id, 'leave')}>
+              End emergency → on leave
             </button>
-            <button type="button" onClick={() => endEmergency(p.id, 'active')}>
-              End emergency → fully returned
+            <button type="button" className="worker-btn worker-btn--success" onClick={() => endEmergency(p.id, 'active')}>
+              End emergency → returned
             </button>
           </div>
         </div>
@@ -711,13 +746,19 @@ function HrInbox({ personId, onUpdated }) {
                 placeholder="Optional message to employee"
               />
             </label>
-            <div className="worker-task-actions">
-              <button type="button" onClick={() => review(r.id, 'in_review')}>Mark in review</button>
-              <button type="button" onClick={() => review(r.id, 'approved')}>Approve</button>
-              <button type="button" className="worker-btn-warn" onClick={() => review(r.id, 'rejected')}>
+            <div className="worker-btn-group worker-btn-group--wrap">
+              <button type="button" className="worker-btn worker-btn--secondary" onClick={() => review(r.id, 'in_review')}>
+                In review
+              </button>
+              <button type="button" className="worker-btn worker-btn--success" onClick={() => review(r.id, 'approved')}>
+                Approve
+              </button>
+              <button type="button" className="worker-btn worker-btn--danger" onClick={() => review(r.id, 'rejected')}>
                 Reject
               </button>
-              <button type="button" onClick={() => review(r.id, 'met')}>Close (met)</button>
+              <button type="button" className="worker-btn worker-btn--ghost" onClick={() => review(r.id, 'met')}>
+                Close
+              </button>
             </div>
             <label className="worker-label">
               Issue HR task
@@ -727,8 +768,8 @@ function HrInbox({ personId, onUpdated }) {
                 placeholder="e.g. Schedule return-to-work check-in"
               />
             </label>
-            <button type="button" className="worker-btn-primary" onClick={() => createTask(r.id)}>
-              Create task for me
+            <button type="button" className="worker-btn worker-btn--primary" onClick={() => createTask(r.id)}>
+              Create HR task
             </button>
           </li>
         ))}
@@ -804,6 +845,10 @@ export default function App() {
   }, [personId, loadDashboard]);
 
   function handleLogin(person) {
+    setLoading(true);
+    setError(null);
+    setDashboard(null);
+    setTab('overview');
     setPersonId(person.id);
     try {
       sessionStorage.setItem(SESSION_KEY, person.id);
@@ -815,6 +860,8 @@ export default function App() {
   function logout() {
     setPersonId('');
     setDashboard(null);
+    setLoading(false);
+    setError(null);
     try {
       sessionStorage.removeItem(SESSION_KEY);
     } catch {
@@ -826,17 +873,18 @@ export default function App() {
     return <LoginScreen onLogin={handleLogin} />;
   }
 
-  if (loading && !dashboard) {
+  if (!dashboard) {
+    if (error) {
+      return (
+        <div className="worker-error-page">
+          <p>{error}</p>
+          <button type="button" className="worker-btn worker-btn--secondary" onClick={logout}>
+            Sign out
+          </button>
+        </div>
+      );
+    }
     return <div className="worker-loading">Loading your workspace…</div>;
-  }
-
-  if (error && !dashboard) {
-    return (
-      <div className="worker-error-page">
-        <p>{error}</p>
-        <button type="button" onClick={logout}>Sign out</button>
-      </div>
-    );
   }
 
   const p = dashboard.person;
@@ -875,13 +923,13 @@ export default function App() {
             )}
           </div>
           <div className="worker-header-actions">
-            <button type="button" className="worker-theme-btn" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
+            <button type="button" className="worker-btn worker-btn--ghost worker-btn--sm" onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}>
               {theme === 'dark' ? '☀ Light' : '☾ Dark'}
             </button>
-            <button type="button" className="worker-ghost-btn" onClick={loadDashboard}>
+            <button type="button" className="worker-btn worker-btn--ghost worker-btn--sm" onClick={loadDashboard}>
               Refresh
             </button>
-            <button type="button" className="worker-ghost-btn" onClick={logout}>
+            <button type="button" className="worker-btn worker-btn--ghost worker-btn--sm" onClick={logout}>
               Sign out
             </button>
           </div>
@@ -902,7 +950,7 @@ export default function App() {
               className={tab === id ? 'active' : ''}
               onClick={() => setTab(id)}
             >
-              {id.charAt(0).toUpperCase() + id.slice(1)}
+              {id === 'hr' ? 'HR' : id.charAt(0).toUpperCase() + id.slice(1)}
               {id === 'tasks' && stats.totalTasks > 0 && (
                 <span className="worker-nav-badge">{stats.totalTasks}</span>
               )}
@@ -916,41 +964,68 @@ export default function App() {
 
       <main className="worker-main">
         {tab === 'overview' && (
-          <section>
-            <div className="worker-stats-row">
-              <StatCard label="Active tasks" value={stats.totalTasks - stats.done} tone="accent" />
-              <StatCard label="In progress" value={stats.inProgress} />
-              <StatCard label="Blocked" value={stats.blocked} tone="warn" />
-              <StatCard label="Done" value={stats.done} tone="ok" />
-              <StatCard label="Projects" value={stats.activeProjects} />
-              <StatCard label="Open requests" value={stats.openRequests} />
-            </div>
-            <p className="worker-muted worker-load-line">
-              Current load index: <strong>{stats.currentLoad}</strong> assigned open task(s)
+          <section className="worker-overview">
+            <p className="worker-overview-intro">
+              Your workspace at a glance. Open <strong>Tasks</strong> to mark work in progress, done, or blocked.
             </p>
+            <div className="worker-overview-cards">
+              <div className="worker-overview-card">
+                <span className="worker-overview-value">{Math.max(0, stats.totalTasks - stats.done)}</span>
+                <span className="worker-overview-label">Open assignments</span>
+              </div>
+              <div className="worker-overview-card">
+                <span className="worker-overview-value">{stats.activeProjects}</span>
+                <span className="worker-overview-label">Active projects</span>
+              </div>
+              <div className="worker-overview-card">
+                <span className="worker-overview-value">{stats.openRequests}</span>
+                <span className="worker-overview-label">Open requests</span>
+              </div>
+            </div>
             {stats.blocked > 0 && (
               <div className="worker-banner worker-banner--warn">
-                You have {stats.blocked} blocked task(s). Leadership may be notified for replanning.
+                {stats.blocked} assignment(s) need attention — open <strong>Tasks</strong> to update status.
               </div>
             )}
-            <h2>Up next</h2>
-            {dashboard.tasks.slice(0, 3).map((t) => (
-              <TaskCard key={`${t.projectId}-${t.id}`} task={t} personId={personId} onUpdated={loadDashboard} />
+            <div className="worker-section-head">
+              <h2>Up next</h2>
+              <button type="button" className="worker-btn worker-btn--secondary worker-btn--sm" onClick={() => setTab('tasks')}>
+                All tasks →
+              </button>
+            </div>
+            {dashboard.tasks.slice(0, 5).map((t) => (
+              <TaskPreviewCard
+                key={`${t.projectId}-${t.id}`}
+                task={t}
+                onOpenTasks={() => setTab('tasks')}
+              />
             ))}
             {dashboard.tasks.length === 0 && (
               <p className="worker-muted">No assigned tasks yet. Check back after team assignment runs.</p>
+            )}
+            {stats.openRequests > 0 && (
+              <div className="worker-overview-footer">
+                <button type="button" className="worker-btn worker-btn--ghost worker-btn--sm" onClick={() => setTab('requests')}>
+                  View {stats.openRequests} open request{stats.openRequests !== 1 ? 's' : ''} →
+                </button>
+              </div>
             )}
           </section>
         )}
 
         {tab === 'tasks' && (
           <section>
-            <div className="worker-filter-row">
+            <p className="worker-muted worker-tasks-hint">
+              Update your work here. Status changes sync to Leadership View and may trigger project AI review.
+            </p>
+            <div className="worker-chip-row" role="tablist" aria-label="Filter tasks">
               {['all', 'in_progress', 'blocked', 'pending', 'done'].map((f) => (
                 <button
                   key={f}
                   type="button"
-                  className={taskFilter === f ? 'active' : ''}
+                  role="tab"
+                  aria-selected={taskFilter === f}
+                  className={`worker-chip ${taskFilter === f ? 'is-active' : ''}`}
                   onClick={() => setTaskFilter(f)}
                 >
                   {f === 'all' ? 'All' : statusLabel(f)}

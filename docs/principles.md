@@ -42,6 +42,12 @@ Design principles for the AI-Native Organization System. These guide every featu
 - **No unnecessary integrations** — Add Slack, Jira, or calendars only when they clearly serve the loop.
 - **No overengineering** — Prefer clarity and explicitness over abstraction in the MVP.
 
+## 7. Workforce signals, not surveillance
+
+- **Workforce analytics** (productivity, reliability, engagement, health indexes) are **explainable operational signals** derived from tasks, events, and requests — not hidden scores of human worth.
+- Leadership uses them for coordination (overload, stagnation, at-risk bands), not automated HR decisions.
+- Help chat and the Workforce tab expose the same underlying metrics for questions like “who is overloaded?” or “which department is struggling?”
+
 ---
 
 _If a feature breaks the core loop or violates these principles, it should not be implemented._

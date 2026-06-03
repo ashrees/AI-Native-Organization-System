@@ -49,7 +49,7 @@ export default function HelpChat({ projects = [] }) {
     {
       role: 'assistant',
       content:
-        'Ask me about projects, risk, worker requests, assignments, or schedules. I use live org data and route to the right AI agent.',
+        'Ask me anything about the org — projects, tasks, people, workforce health & productivity, worker requests, events, leave, and AI activity. I use a full live snapshot and route to the right agent.',
       meta: { agentLabel: 'Help' },
     },
   ]);
@@ -143,7 +143,7 @@ export default function HelpChat({ projects = [] }) {
           <header className="help-chat-header">
             <div>
               <h2 className="help-chat-title">Help</h2>
-              <p className="help-chat-subtitle">Fast answers from org AI agents</p>
+              <p className="help-chat-subtitle">Full org context · all projects & people</p>
             </div>
             <button
               type="button"

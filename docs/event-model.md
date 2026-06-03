@@ -1,19 +1,19 @@
 # Event model and Project State
 
-Source of truth for event schema and project state. Server `models/` implement or re-export these definitions.
+Source of truth for event schema and project state. Server `models/` implement these definitions.
 
 ---
 
 ## Base Event schema
 
-Events are the single source of truth. Every state change comes from an event. Design supports classification, routing, and traceability.
+Events are the single source of truth. Every state change comes from an event.
 
 ### Required fields (every event)
 
 | Field | Type | Purpose |
 |-------|------|---------|
 | `id` | string (UUID) | Unique; idempotency and reference |
-| `type` | enum | Drives routing and Project AI logic |
+| `type` | enum | Drives routing and apply logic |
 | `timestamp` | ISO 8601 | Ordering and audit |
 | `projectId` | string | Which project this belongs to |
 | `source` | enum | Who/what produced the event |
@@ -24,9 +24,11 @@ Events are the single source of truth. Every state change comes from an event. D
 - `request`
 - `plan_created`
 - `assignment`
+- `unassignment`
 - `schedule_proposed`
 - `execution`
 - `decision`
+- `need`
 
 ### Source enum
 
@@ -42,7 +44,7 @@ Events are the single source of truth. Every state change comes from an event. D
 | Field | Type | Purpose |
 |-------|------|---------|
 | `correlationId` | string | Link related events (e.g. request → plan → assignments) |
-| `rationale` | string | Required for AI-generated events; explains "why" |
+| `rationale` | string | Explains "why" (required for AI-generated events in practice) |
 
 ---
 
@@ -65,12 +67,12 @@ Output of Orchestrator AI.
 
 **payload:**
 
-- `tasks` (array of `{ id, title?, description? }`, required) — full task details
-- `taskIds` (array of string, optional) — if tasks are stored elsewhere
+- `tasks` (array of `{ id, title?, description?, requiredDepartments? }`, required)
 - `summary` (string, optional)
-- `riskLevel` (string, optional: `low` | `medium` | `high`)
-- `impactLevel` (string, optional)
-- `rationale` (string, optional; prefer on envelope for AI events)
+- `riskLevel` (`low` | `medium` | `high`, optional)
+- `impactLevel` (optional)
+
+Orchestrator may also emit related `need` events for plan dependencies.
 
 ### `assignment`
 
@@ -80,13 +82,18 @@ Output of Team Builder AI or human override.
 
 - `taskId` (string, required)
 - `personId` (string, required)
-- `person` (object, optional) — snapshot of the assignee at assignment time:
-  - `id` (string)
-  - `name` (string)
-  - `department` (string)
-  - `team` (string)
-  - `role` (string)
-- `rationale` (string, optional)
+- `person` (object, optional) — assignee snapshot: `id`, `name`, `department`, `team`, `role`
+- `assignmentGapFill` (boolean, optional) — targeted fill without full replan
+
+### `unassignment`
+
+Removes assignee (e.g. leave approval, transfer).
+
+**payload:**
+
+- `taskId` (string, required)
+- `personId` (string, optional)
+- `reason` (string, optional)
 
 ### `schedule_proposed`
 
@@ -97,87 +104,120 @@ Output of Scheduler AI.
 - `taskId` (string, required)
 - `proposedStart` (ISO 8601, required)
 - `proposedEnd` (ISO 8601, required)
-- `rationale` (string, optional)
+- `projectAIDelegated` (boolean, optional)
 
 ### `execution`
 
-Human execution update (replaces manual status reports).
+Human execution update.
 
 **payload:**
 
 - `taskId` (string, required)
-- `status` (string: `in_progress` | `done` | `blocked`, required)
-- `outcome` (string, optional)
+- `status` (`in_progress` | `done` | `blocked`, required)
+- `personId` (string, optional) — worker who updated (Worker Portal)
 - `notes` (string, optional)
+- `requestAssignment` (boolean, optional) — triggers assignment gap fill
+
+**Side effects:**
+
+- `blocked` → blocker recorded; may trigger replan
+- `in_progress` / `done` → blocker for task cleared
+- Triggers **Project AI** status check (debounced)
 
 ### `decision`
 
-Human judgment (approve, reject, reprioritize, kill project).
+Human or AI judgment.
+
+**payload (common `decisionType` values):**
+
+| decisionType | Source | Effect |
+|--------------|--------|--------|
+| `kill_project` / `kill` | human | `status = killed`; assignees cleared |
+| `complete` / `completed` | human | `status = completed` |
+| `project_assessment` | project_ai | Updates `risk`; may complete project if all tasks done |
+| `assignment_gap_fill` | system | Audit summary after gap-fill run |
+| `reprioritize` | human | May trigger replan |
+| `emergency_active` / `emergency_return_end` | system | Person availability |
+| `worker_request_*` | system | Request lifecycle audit |
+
+**project_assessment** additionally includes:
+
+- `riskLevel`, `riskReason`, `summary`, `recentChanges`
+- `suggestProjectCompleted` (boolean)
+- `agentActions` (array) — planned delegations to other agents
+
+### `need`
+
+Worker or AI-recorded requirement.
 
 **payload:**
 
-- `decisionType` (string, required: e.g. `approve` | `reject` | `reprioritize` | `kill_project`)
-- `targetId` (string, optional)
-- `reason` (string, optional)
-- `newPriority` (string, optional)
+- `kind` (string, required)
+- `description` (string, required)
+- `title` (string, optional)
+- `taskId` (string, optional)
+- `status` (`open` | `in_review` | `approved` | `rejected` | `met` | `cancelled`, optional)
+- `personId`, `handlingMode`, routing fields — worker request envelope
+
+Human `need` events (`source: human`) are worker requests. Persisted to the `needs` table for querying.
 
 ---
 
 ## Stored event envelope
 
-What gets persisted (append-only log):
+Append-only log:
 
 - `id`, `type`, `timestamp`, `projectId`, `source`, `payload`
 - `correlationId` (optional), `rationale` (optional)
 
-Project AI and leadership views read from this log (and from materialized project state for speed).
+Leadership views and AI agents read from this log and from materialized project state.
 
 ---
 
 ## Project State model
 
-Project state is **owned by Project AI** and updated **only by applying events**. Every field should be derivable from the event stream (or snapshot + subsequent events).
+Updated **only by applying events** (`server/models/projectState.js`).
 
 ### Structure (one object per project)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `id` | string | Project id |
-| `title` | string | From initial request or decision |
-| `department` | string | Owning department (from request or project catalog) |
-| `team` | string | Owning team |
-| `sponsor` | string | Project sponsor or owner |
-| `status` | enum | `active` \| `completed` \| `killed` (from `decision` events) |
-| `progress` | object | See below |
-| `risk` | object | See below |
-| `blockers` | array | See below |
-| `dependencies` | array | See below |
-| `lastUpdatedAt` | string (ISO 8601) | Timestamp of last event applied |
-| `lastEventId` | string | Id of last applied event (replay and debugging) |
+| `title` | string | From request or plan |
+| `department`, `team`, `sponsor` | string | Org metadata |
+| `status` | enum | `active` \| `completed` \| `killed` |
+| `progress` | object | `{ tasks: [...] }` |
+| `risk` | object | `{ level, reasons[] }` |
+| `blockers` | array | `{ taskId, description, raisedAt }` |
+| `dependencies` | array | Task ordering |
+| `needs` | array | Open/resolved needs on project |
+| `lastUpdatedAt`, `lastEventId` | string | Replay / debugging |
 
-### progress
+### progress.tasks
 
-- `tasks` (array): each task `{ id, title?, assigneeId?, status?, scheduledStart?, scheduledEnd? }`
-- Optional: `percentComplete` or counts (derived from tasks)
+Each task may include:
 
-### risk
+- `id`, `title`, `description`, `status`
+- `assigneeId`, `assignee` (snapshot)
+- `scheduledStart`, `scheduledEnd`
 
-- `level` (string): `low` \| `medium` \| `high`
-- `reasons` (array of string): from rationale or events
+### Invariants
 
-### blockers
-
-- Array of `{ taskId, description, raisedAt }` — from execution events (e.g. status `blocked` + notes)
-
-### dependencies
-
-- Array of `{ fromTaskId, toTaskId }` — task ordering from plan or later events
+- State is never edited directly; only `applyEvent` / `applyEvents`.
+- AI agents cannot create new projects (project must exist from human/system first).
+- AI-generated risk and assessments trace to `decision` or `plan_created` events with rationale.
 
 ---
 
-## Invariants
+## AI agent rules
 
-- State is **never** edited directly; only **event handlers** (in Project AI / model layer) compute new state from previous state + next event.
-- All AI-generated state (e.g. risk level) must be traceable to an event that contains a `rationale`.
+| Agent | May emit |
+|-------|----------|
+| orchestrator | `plan_created`, `need` |
+| team_builder | `assignment` |
+| scheduler | `schedule_proposed` |
+| project_ai | `decision` (`project_assessment`), `need` (via delegation) |
+| system | `request` (replan), `decision` (gap fill, emergency) |
+| human | any type including `request`, `execution`, `decision`, `need` |
 
-More event types (e.g. `blocker_raised`, `dependency_added`) can be added later without breaking the envelope.
+See [orchestration-loop.md](orchestration-loop.md) and [architecture.md](architecture.md).

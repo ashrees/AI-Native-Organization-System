@@ -6,7 +6,7 @@ High-level architecture of the AI-Native Organization System and the core loop.
 
 ## Overview
 
-The system is built around **one loop**: request/signal → orchestration → assignment → scheduling → execution → events → state update → leadership clarity → replan when needed. All components exist to keep this loop intact.
+The system is built around **one loop**: request → orchestration → assignment → scheduling → execution → events → Project AI coordination → leadership clarity → replan when needed. Supporting systems (workforce analytics, help chat, worker portal) read the same event-backed store.
 
 ---
 
@@ -26,13 +26,16 @@ flowchart LR
   subgraph human [Human]
     Execute[Execute work]
     Decide[Decisions and overrides]
+    WorkerReq[Worker requests]
   end
   subgraph state [State]
-    Events[Event log]
+    Events[Event log Postgres]
     State[Project state]
   end
   subgraph view [Leadership]
-    View[Read-only view]
+    LV[Leadership View]
+    WF[Workforce analytics]
+    HC[Help chat]
   end
 
   Request --> Orch
@@ -41,11 +44,16 @@ flowchart LR
   Sched --> Execute
   Execute --> Events
   Events --> ProjAI
+  ProjAI -->|delegate| Orch
+  ProjAI -->|delegate| Team
+  ProjAI -->|delegate| Sched
   ProjAI --> State
-  State --> View
-  View --> Decide
+  State --> LV
+  Events --> WF
+  Events --> HC
+  WorkerReq --> Events
+  LV --> Decide
   Decide --> Events
-  Events --> Orch
 ```
 
 ---
@@ -54,31 +62,69 @@ flowchart LR
 
 | Component | Responsibility |
 |-----------|----------------|
-| **Event Intake** | Accepts structured events (request, assignment, execution, decision). Validates and persists to event log. |
-| **Orchestrator AI** | Breaks high-level requests into sub-tasks; estimates risk and impact; outputs structured plan (JSON). |
-| **Team Builder AI** | Selects people by skill, load, project relevance; emits assignments with rationale. |
-| **Scheduler AI** | Proposes timelines and task ordering; respects availability (mocked in MVP). |
-| **Project AI** | Owns project truth. Updates state only by applying events (progress, risk, blockers, dependencies). |
-| **Event log** | Append-only store of all events. Source of truth for replay and audit. |
-| **Project state** | Materialized view per project; derived from events. Read by Leadership view and by AI for context. |
-| **Leadership view** | Read-only. Shows what is happening, why, and what changed. No micromanagement. |
+| **Event intake** (`routes/events.js`) | Validate, persist, SSE, route by type |
+| **Orchestrator AI** | Plans from requests; tasks, risk, needs |
+| **Team Builder AI** | Assignments with rationale; skips `on_leave` |
+| **Scheduler AI** | Proposed timelines per task |
+| **Project AI** | Status assessment, periodic polls, delegates via `agentActions` |
+| **Org AI** | Org-wide insights (`routes/orgInsights.js`) |
+| **Assignment gap fill** | Team Builder + Scheduler for unassigned tasks only |
+| **Workforce analytics** | Explainable indexes from tasks, events, requests, leave |
+| **Help chat** | LLM Q&A with full org + workforce snapshot |
+| **Worker Portal API** (`routes/worker.js`) | Dashboard, status, requests, HR, emergency return |
+| **Postgres store** | Events, project state, people, needs |
+| **Leadership View** | Read-mostly UI + event submission |
+| **Worker Portal** | Separate React app for contributors |
 
 ---
 
 ## Data flow
 
-1. **Inbound:** A `request` event (or other event type) is POSTed to the intake.
-2. **Validate & persist:** Event is validated against the base schema and appended to the event log.
-3. **Route:** By `event.type`, the system either runs the request pipeline (Orchestrator → Team Builder → Scheduler) or applies the event to state (Project AI).
-4. **Apply:** Project AI loads current project state, applies the event (and any newly emitted events), and persists updated state.
-5. **Outbound:** Leadership view reads project state (and optionally recent events). No write path from the view.
+1. **Inbound:** Event POSTed to `/events` or `/worker/*`.
+2. **Validate & persist:** Append to event log; apply to in-memory project state; save to Postgres.
+3. **Route by type:**
+   - `request` → `handleRequestFlow` (Orchestrator → Team Builder → Scheduler)
+   - Other types → `applyEvent` only
+   - Human `execution` → may trigger gap fill, replan (blocked), Project AI check
+4. **Project AI:** Debounced status check; may emit `project_assessment` and run `projectAIActions` (assign, reschedule, replan, need).
+5. **SSE:** Broadcast to Leadership and Worker clients.
+6. **Read paths:** Leadership/Worker UIs, `/workforce/analytics`, `/help-chat`, `/org-insights`.
+
+---
+
+## Project AI coordination
+
+Project AI sits **above** the tier-1–3 pipeline for ongoing monitoring:
+
+| Trigger | Examples |
+|---------|----------|
+| Events | `execution`, `plan_created`, `assignment`, `schedule_proposed`, `need` |
+| Poll | `PROJECT_AI_POLL_INTERVAL_MS` (default 5 min) |
+| Skipped | Own `project_assessment` decisions (avoid loops) |
+
+After assessment, `executeAgentActions` may invoke:
+
+- `fillAssignmentGaps` → Team Builder + Scheduler
+- `rescheduleTasks` → Scheduler
+- `triggerReplan` → system `request` + `handleRequestFlow`
+
+---
+
+## Worker request flow
+
+1. Worker submits `need` (`source: human`) via Worker Portal.
+2. `workerRequestHandler` routes by kind (`requestRouting.js`): roles, AI agent, handling mode.
+3. AI mode may create review tasks via Team Builder.
+4. HR or project reviewers PATCH status via Worker or Leadership APIs.
+5. `workerRequestEffects` on approve: leave, unassignment, transfer, etc.
 
 ---
 
 ## Invariants
 
-- **State is only updated via events.** No direct writes to project state from outside the apply logic.
-- **AI-generated events include rationale.** Required for transparency.
-- **Replanning reuses the same loop.** Emit a new request (or replan event) with context; Orchestrator runs again.
+- **State is only updated via events.**
+- **AI-generated events include rationale** where applicable.
+- **Replanning reuses the same orchestration pipeline.**
+- **Workforce indexes are derived metrics**, not hidden scoring of individuals.
 
-See [event-model.md](event-model.md) for schemas and [orchestration-loop.md](orchestration-loop.md) for pseudocode.
+See [event-model.md](event-model.md) and [orchestration-loop.md](orchestration-loop.md).

@@ -1,68 +1,147 @@
 # Orchestration loop (pseudocode)
 
-The loop: Request → Orchestrator → Team Builder → Scheduler → Humans execute → Events → Project AI updates state → Leadership clarity → replan if needed.
+The loop: Request → Orchestrator → Team Builder → Scheduler → Humans execute → Events → Project AI coordinates → Leadership clarity → replan if needed.
 
 ---
 
 ## Main loop: ON new event received at intake
 
 ```
-1. Validate event against base Event schema (id, type, timestamp, projectId, source, payload).
+1. Validate event against base Event schema.
 
-2. Persist event to event log (append-only).
+2. Persist event to event log (Postgres + in-memory).
 
-3. Route by event.type:
+3. Broadcast SSE to connected clients.
 
-   - "request":
-       a. Call Orchestrator AI with request payload (+ context: project state if any).
-       b. Orchestrator returns structured plan (tasks, risk, impact).
-       c. Emit "plan_created" event (source: orchestrator, correlationId: request.id).
-       d. For each task in plan, call Team Builder AI (skills, load, project) → assignments.
-       e. Emit "assignment" event(s) (source: team_builder, correlationId: plan_created.id).
-       f. Call Scheduler AI with task list + assignments → proposed dates.
-       g. Emit "schedule_proposed" event(s) (source: scheduler).
-       h. Project AI applies all new events to project state (see below).
-       i. If risk/blockers warrant, optionally trigger replan (emit or re-call orchestrator with context).
+4. Route by event.type:
 
-   - "plan_created":
-       Apply to project state via Project AI (create/update tasks, risk, dependencies).
+   - "request" (and project status != killed):
+       a. Orchestrator AI → plan (tasks, risk, impact, needs)
+       b. Emit "plan_created" (source: orchestrator)
+       c. Emit "need" events for orchestrator needs[]
+       d. For each task: Team Builder AI → assignment events
+       e. Scheduler AI → schedule_proposed events
+       f. Each emit triggers Project AI status check (debounced)
 
-   - "assignment" | "schedule_proposed":
-       Apply to project state via Project AI (update tasks: assignees, schedule).
+   - "execution" (human):
+       g. Apply execution (status, blockers)
+       h. Project AI status check
+       i. Optional assignment gap fill (requestAssignment / keywords / unassigned in_progress)
+       j. If blocked + active project: emit system replan request → handleRequestFlow
 
-   - "execution":
-       Apply to project state (task status; if status=blocked, add to blockers).
+   - "decision" (reprioritize):
+       k. Apply decision; may emit replan request
 
-   - "decision":
-       Apply to project state (e.g. status=killed, priority change); if reprioritize, may emit new request or replan.
+   - Other types (assignment, schedule_proposed, need, unassignment, plan_created):
+       l. Apply via projectState.applyEvent
+       m. Project AI status check if shouldScheduleStatusCheck(event)
 
-4. After any apply: leadership view can read updated project state (read-only).
+5. Leadership / Worker views read updated state (SSE refresh).
+```
+
+---
+
+## Agent hierarchy (request pipeline)
+
+Serialized LLM access; tier order:
+
+| Tier | Agent | Output events |
+|------|-------|----------------|
+| 1 | orchestrator | `plan_created`, `need` |
+| 2 | team_builder | `assignment` (per task) |
+| 3 | scheduler | `schedule_proposed` (per task) |
+
+Retries: `AGENT_STEP_RETRIES` with `AGENT_STEP_RETRY_DELAY_MS`. Stubs only after retries exhaust or no LLM.
+
+---
+
+## Project AI status check (parallel to pipeline)
+
+```
+ON shouldScheduleStatusCheck(event) OR periodic poll:
+
+1. Debounce per projectId (PROJECT_AI_DEBOUNCE_MS).
+
+2. Build metrics + RAG agentContext.
+
+3. LLM or stub → assessment:
+   { summary, riskLevel, riskReason, recentChanges, suggestProjectCompleted, agentActions[] }
+
+4. Emit decision (source: project_ai, decisionType: project_assessment).
+
+5. FOR EACH agentAction:
+   - team_builder / assign_unassigned → fillAssignmentGaps
+   - team_builder / assign_task → assignOneTask + optional reschedule
+   - scheduler / reschedule → proposeSchedule for tasks missing dates
+   - orchestrator / replan → system request + handleRequestFlow (skip if recent replan)
+   - create_need → need event (source: project_ai)
+
+6. Apply assessment decision to project state (risk, optional complete).
 ```
 
 ---
 
 ## Project AI apply logic (per event)
 
+Same as `projectState.applyEvent`:
+
 ```
-- Load current project state for event.projectId (or create from first event for that project).
+- request: title, org fields, ensure active
+- plan_created: merge tasks, risk
+- assignment: assignee on task
+- unassignment: clear assignee; may reset in_progress → pending
+- schedule_proposed: scheduledStart/scheduledEnd on task
+- execution: task status; blocked → add blocker; else remove blocker for task
+- decision:
+    kill → killed, clear assignees
+    complete → completed
+    project_assessment → risk level; maybe completed if all tasks done
+- need: merge into state.needs[]
 
-- Switch on event.type and payload:
-  - request: set project title from payload.title if new project; ensure status = active.
-  - plan_created: merge tasks from payload into progress.tasks; set risk from payload; set dependencies if provided.
-  - assignment: find task by payload.taskId, set assigneeId = payload.personId.
-  - schedule_proposed: find task by payload.taskId, set scheduledStart/scheduledEnd.
-  - execution: find task by payload.taskId, set status; if status=blocked, append to blockers from notes.
-  - decision: if decisionType=kill_project (or similar), set status=killed; if reprioritize, set priority.
-
-- Set lastUpdatedAt = event.timestamp, lastEventId = event.id.
-
-- Persist project state.
-
-- No direct writes to project state elsewhere; all mutations go through this apply.
+- lastUpdatedAt, lastEventId updated
 ```
+
+---
+
+## Assignment gap fill (subset loop)
+
+```
+ON leadership execution with gap-fill trigger:
+
+1. listUnassignedTasks(project) — not done, no assignee
+
+2. FOR EACH task: Team Builder → assignment event, increment load
+
+3. Scheduler on newly assigned tasks → schedule_proposed
+
+4. Emit decision (system, assignment_gap_fill)
+```
+
+No Orchestrator replan.
 
 ---
 
 ## Replanning
 
-When Project AI or a rule detects "blocker," "risk escalation," or "decision: reprioritize," the system emits a new `request` (or a dedicated `replan_request` type) with context. Orchestrator runs again; the rest of the loop is unchanged. One loop, no special-case code paths.
+| Trigger | Mechanism |
+|---------|-----------|
+| execution.status = blocked | Immediate system `request` + handleRequestFlow |
+| decision reprioritize | system `request` + handleRequestFlow |
+| Project AI agentActions.replan | system `request` if no replan in last ~15 min |
+
+One pipeline for all replans — no separate code path.
+
+---
+
+## Help chat & workforce (read-only)
+
+```
+ON POST /help-chat:
+
+1. Load store (events, projects, people)
+2. buildFullHelpContext → metrics, workforce, worker requests, events, orgInsights
+3. LLM completeText with helpChat.txt prompt
+4. Return answer (or stub fallback with workforce summary)
+```
+
+Workforce data is computed live via `buildWorkforceAnalytics` — same source as `GET /workforce/analytics`.
