@@ -9,6 +9,23 @@
 import { useState, useEffect, useCallback } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
+const THEME_STORAGE_KEY = 'leadership-view-theme';
+
+function getStoredTheme() {
+  try {
+    const stored = localStorage.getItem(THEME_STORAGE_KEY);
+    if (stored === 'light' || stored === 'dark') return stored;
+  } catch {
+    /* ignore */
+  }
+  return 'dark';
+}
+
+function applyTheme(theme) {
+  document.documentElement.setAttribute('data-theme', theme);
+}
+
+applyTheme(getStoredTheme());
 
 async function fetchJson(path) {
   const res = await fetch(`${API_BASE}${path}`);
@@ -36,6 +53,7 @@ function logMessageShort(text, maxSentences = 2) {
 }
 
 export default function App() {
+  const [theme, setTheme] = useState(getStoredTheme);
   const [projects, setProjects] = useState([]);
   const [eventsByProject, setEventsByProject] = useState({});
   const [orgInsights, setOrgInsights] = useState(null);
@@ -79,6 +97,19 @@ export default function App() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    applyTheme(theme);
+    try {
+      localStorage.setItem(THEME_STORAGE_KEY, theme);
+    } catch {
+      /* ignore */
+    }
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+  };
 
   // Load org-level insights separately so the main UI never blocks on LLM calls.
   useEffect(() => {
@@ -214,8 +245,24 @@ export default function App() {
   return (
     <div className="app">
       <header className="app-header">
-        <h1>Leadership View</h1>
-        <p className="subtitle">What is happening, why, and what changed recently.</p>
+        <div className="app-header-top">
+          <div className="app-header-brand">
+            <h1>Leadership View</h1>
+            <p className="subtitle">What is happening, why, and what changed recently.</p>
+          </div>
+          <button
+            type="button"
+            className="theme-toggle"
+            onClick={toggleTheme}
+            aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+            title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          >
+            <span className="theme-toggle-icon" aria-hidden="true">
+              {theme === 'dark' ? '☀' : '☾'}
+            </span>
+            {theme === 'dark' ? 'Light' : 'Dark'}
+          </button>
+        </div>
         <nav className="app-nav" aria-label="Main">
           <button
             type="button"
