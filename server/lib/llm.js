@@ -1,7 +1,7 @@
 /**
- * Shared LLM helper: load prompt templates and call OpenAI or Google Gemini with structured JSON output.
- * Provider selection: if GOOGLE_API_KEY or GEMINI_API_KEY is set, use Google Gemini; else if OPENAI_API_KEY is set, use OpenAI.
- * Replaceable later (e.g. other provider). Callers use complete() and get parsed JSON or null.
+ * Shared LLM helper: load prompt templates and call Google Gemini, OpenAI, DeepSeek, or Ollama
+ * with structured JSON output. Set LLM_PROVIDER or rely on auto detection from API keys.
+ * Callers use complete() and get parsed JSON or null.
  *
  * Model access is serialized: only one agent uses the LLM at a time. Agents wait for the lock before calling the provider.
  */
@@ -9,21 +9,116 @@
 const path = require('path');
 const fs = require('fs');
 const postgresStore = require('../store/postgresStore');
+const { describeLlmWork, agentLabel } = require('./llmQueueDescribe');
 
 const PROMPTS_DIR = path.join(__dirname, '../../prompts');
 
 /** Promise-based mutex: only one caller runs at a time; others wait. */
 let _modelLock = Promise.resolve();
-async function withModelLock(fn) {
+let _llmCurrent = { agent: null, since: null, waiting: 0, work: null };
+
+function normalizeLockMeta(lockMeta) {
+  if (lockMeta == null) return {};
+  if (typeof lockMeta === 'string') return { agent: lockMeta };
+  const meta = { ...lockMeta };
+  if (!meta.taskId && meta.context && typeof meta.context === 'object') {
+    meta.taskId = meta.context.taskId || meta.context.task_id || null;
+  }
+  return meta;
+}
+
+function getLlmQueueStatus() {
+  const work = _llmCurrent.work;
+  return {
+    busy: !!_llmCurrent.agent,
+    currentAgent: _llmCurrent.agent,
+    since: _llmCurrent.since,
+    waiting: _llmCurrent.waiting,
+    currentWork: work
+      ? {
+          summary: work.summary,
+          rationale: work.rationale,
+          agent: work.agent,
+          projectId: work.projectId,
+          projectTitle: work.projectTitle,
+          taskId: work.taskId,
+        }
+      : null,
+  };
+}
+
+/** Persist LLM lock / queue state for Ops Monitor streams (agent_activity). */
+function recordLlmQueueActivity(described, extra = {}) {
+  const id = `llm-q-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const summary = String(described.summary || 'LLM queue').slice(0, 200);
+  const rationale = described.rationale ? String(described.rationale).slice(0, 500) : null;
+  const message = [summary, rationale].filter(Boolean).join(' — ');
+  postgresStore
+    .insertAgentActivity({
+      id,
+      agentId: 'llm_queue',
+      projectId: described.projectId || extra.projectId || null,
+      taskId: described.taskId || extra.taskId || null,
+      recordKind: 'activity',
+      eventType: extra.eventType || 'llm_queue',
+      status: extra.status || null,
+      summary,
+      rationale,
+      message: message.slice(0, 500),
+      isError: !!extra.isError,
+      correlationEventId: extra.correlationEventId || null,
+      projectTitle: described.projectTitle || extra.projectTitle || null,
+      createdAt: new Date().toISOString(),
+    })
+    .catch((err) => {
+      console.warn('[llm_queue] activity log failed:', err.message);
+    });
+}
+
+async function withModelLock(fn, lockMeta) {
+  const meta = normalizeLockMeta(lockMeta);
+  _llmCurrent.waiting += 1;
+  const queueBehind = _llmCurrent.waiting;
+  if (_llmCurrent.work && queueBehind > 1) {
+    const blockedBy = _llmCurrent.work.agent || _llmCurrent.agent;
+    const queued = describeLlmWork(
+      { ...meta, waiting: queueBehind - 1, blockedBy },
+      {}
+    );
+    recordLlmQueueActivity(
+      {
+        ...queued,
+        summary: `Queued: ${queued.summary}${blockedBy ? ` · behind ${agentLabel(blockedBy)}` : ''}`,
+        rationale: queued.rationale || `${queueBehind - 1} ahead in queue`,
+      },
+      { status: 'waiting', eventType: 'llm_waiting', waiting: queueBehind - 1 }
+    );
+  }
   const prev = _modelLock;
   let release;
   _modelLock = new Promise((resolve) => {
     release = resolve;
   });
   await prev;
+  _llmCurrent.waiting = Math.max(0, _llmCurrent.waiting - 1);
+  const described = describeLlmWork(
+    { ...meta, waiting: _llmCurrent.waiting },
+    {}
+  );
+  _llmCurrent.agent = meta.agent || described.agent || 'llm';
+  _llmCurrent.since = new Date().toISOString();
+  _llmCurrent.work = described;
+  recordLlmQueueActivity(described, {
+    status: 'running',
+    eventType: 'llm_running',
+    waiting: _llmCurrent.waiting,
+  });
   try {
     return await fn();
   } finally {
+    _llmCurrent.agent = null;
+    _llmCurrent.since = null;
+    _llmCurrent.work = null;
     release();
   }
 }
@@ -142,6 +237,39 @@ function parseJsonResponse(text) {
 function cleanEnvValue(value) {
   if (value == null) return '';
   return String(value).replace(/\s+#.*$/, '').trim();
+}
+
+const DEEPSEEK_DEFAULT_BASE_URL = 'https://api.deepseek.com';
+const DEEPSEEK_DEFAULT_MODEL = 'deepseek-chat';
+
+/** DeepSeek API (OpenAI-compatible). https://api-docs.deepseek.com */
+function getDeepSeekConfig(options = {}) {
+  const apiKey = cleanEnvValue(process.env.DEEPSEEK_API_KEY);
+  const baseURL = cleanEnvValue(
+    process.env.DEEPSEEK_BASE_URL || DEEPSEEK_DEFAULT_BASE_URL
+  ).replace(/\/$/, '');
+  const model = cleanEnvValue(options.model || process.env.DEEPSEEK_MODEL || DEEPSEEK_DEFAULT_MODEL);
+  return { apiKey, baseURL, model, label: 'DeepSeek' };
+}
+
+function hasDeepSeekKey() {
+  return !!cleanEnvValue(process.env.DEEPSEEK_API_KEY);
+}
+
+function createOpenAICompatibleClient({ apiKey, baseURL }) {
+  if (!apiKey) return null;
+  const OpenAI = require('openai');
+  const opts = { apiKey };
+  if (baseURL) opts.baseURL = baseURL;
+  return new OpenAI(opts);
+}
+
+/** Per-agent step timeout hint (orchestrator, scheduler, team builder). */
+function agentLlmTimeoutMs() {
+  const p = cleanEnvValue(process.env.LLM_PROVIDER || '').toLowerCase();
+  if (p === 'ollama' || p === 'deepseek') return 60000;
+  const fromEnv = parseInt(process.env.AGENT_LLM_TIMEOUT_MS || '0', 10);
+  return fromEnv > 0 ? fromEnv : 2500;
 }
 
 /** Default free-tier cloud models (direct API at ollama.com). See https://docs.ollama.com/cloud */
@@ -544,17 +672,13 @@ async function completeWithOllama(systemPrompt, userMessage, options = {}) {
  * Call OpenAI chat completions with system prompt and user message; request JSON output.
  * Returns parsed JSON object, or null if no API key or on error.
  */
-async function completeWithOpenAI(systemPrompt, userMessage, options = {}) {
-  const apiKey = cleanEnvValue(process.env.OPENAI_API_KEY);
-  if (!apiKey) return null;
+async function completeWithOpenAICompatible(systemPrompt, userMessage, options, clientConfig) {
+  const client = createOpenAICompatibleClient(clientConfig);
+  if (!client) return null;
 
   try {
-    const OpenAI = require('openai');
-    const client = new OpenAI({ apiKey });
-    const model = cleanEnvValue(options.model || 'gpt-4o-mini');
-
     const response = await client.chat.completions.create({
-      model,
+      model: clientConfig.model,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage },
@@ -568,9 +692,32 @@ async function completeWithOpenAI(systemPrompt, userMessage, options = {}) {
 
     return parseJsonResponse(content) || (() => { try { return JSON.parse(content); } catch (_) { return null; } })();
   } catch (err) {
-    console.error('OpenAI complete error:', err.message);
+    console.error(`${clientConfig.label || 'OpenAI-compatible'} complete error:`, err.message);
     return null;
   }
+}
+
+async function completeWithOpenAI(systemPrompt, userMessage, options = {}) {
+  const apiKey = cleanEnvValue(process.env.OPENAI_API_KEY);
+  if (!apiKey) return null;
+  const baseURL = cleanEnvValue(process.env.OPENAI_BASE_URL) || undefined;
+  return completeWithOpenAICompatible(systemPrompt, userMessage, options, {
+    apiKey,
+    baseURL,
+    model: cleanEnvValue(options.model || process.env.OPENAI_MODEL || 'gpt-4o-mini'),
+    label: 'OpenAI',
+  });
+}
+
+async function completeWithDeepSeek(systemPrompt, userMessage, options = {}) {
+  const cfg = getDeepSeekConfig(options);
+  if (!cfg.apiKey) return null;
+  return completeWithOpenAICompatible(systemPrompt, userMessage, options, {
+    apiKey: cfg.apiKey,
+    baseURL: cfg.baseURL,
+    model: cfg.model,
+    label: cfg.label,
+  });
 }
 
 /**
@@ -595,6 +742,10 @@ async function complete(systemPrompt, userMessage, options = {}) {
         console.log('[LLM] Provider preference: OpenAI');
         return completeWithOpenAI(systemPrompt, userMessage, options);
       }
+      if (providerPref === 'deepseek') {
+        console.log(`[LLM] Provider preference: ${getDeepSeekConfig(options).label} (${getDeepSeekConfig(options).model})`);
+        return completeWithDeepSeek(systemPrompt, userMessage, options);
+      }
       if (providerPref === 'ollama') {
         console.log(`[LLM] Provider preference: ${getOllamaConfig(options).label}`);
         return completeWithOllama(systemPrompt, userMessage, options);
@@ -603,6 +754,12 @@ async function complete(systemPrompt, userMessage, options = {}) {
       if (useGoogle) {
         console.log('[LLM] Using Google Gemini via @google/genai (auto)');
         const r = await completeWithGoogle(systemPrompt, userMessage, options);
+        if (r !== null) return r;
+      }
+      if (hasDeepSeekKey()) {
+        const ds = getDeepSeekConfig(options);
+        console.log(`[LLM] Using ${ds.label} (auto, ${ds.model})`);
+        const r = await completeWithDeepSeek(systemPrompt, userMessage, options);
         if (r !== null) return r;
       }
       if (!!cleanEnvValue(process.env.OPENAI_API_KEY)) {
@@ -658,6 +815,14 @@ async function complete(systemPrompt, userMessage, options = {}) {
       error: 'all_attempts_null',
     });
     return null;
+  }, {
+    agent: options.agent,
+    context: options.context,
+    projectId: options.projectId,
+    projectTitle: options.projectTitle,
+    taskId: options.taskId,
+    provider: options.provider,
+    model: options.model,
   });
 }
 
@@ -703,24 +868,43 @@ async function completeTextWithOllama(systemPrompt, userMessage, options = {}) {
   return null;
 }
 
-async function completeTextWithOpenAI(systemPrompt, userMessage, options = {}) {
-  const apiKey = cleanEnvValue(process.env.OPENAI_API_KEY);
-  if (!apiKey) return null;
+async function completeTextWithOpenAICompatible(systemPrompt, userMessage, options, clientConfig) {
+  const client = createOpenAICompatibleClient(clientConfig);
+  if (!client) return null;
   try {
-    const OpenAI = require('openai');
-    const client = new OpenAI({ apiKey });
-    const model = cleanEnvValue(options.model || 'gpt-4o-mini');
     const response = await client.chat.completions.create({
-      model,
+      model: clientConfig.model,
       messages: buildChatMessages(systemPrompt, userMessage, options),
       temperature: 0.3,
     });
     const content = response.choices?.[0]?.message?.content;
     return content && typeof content === 'string' ? content.trim() : null;
   } catch (err) {
-    console.error('OpenAI completeText error:', err.message);
+    console.error(`${clientConfig.label || 'OpenAI-compatible'} completeText error:`, err.message);
     return null;
   }
+}
+
+async function completeTextWithOpenAI(systemPrompt, userMessage, options = {}) {
+  const apiKey = cleanEnvValue(process.env.OPENAI_API_KEY);
+  if (!apiKey) return null;
+  return completeTextWithOpenAICompatible(systemPrompt, userMessage, options, {
+    apiKey,
+    baseURL: cleanEnvValue(process.env.OPENAI_BASE_URL) || undefined,
+    model: cleanEnvValue(options.model || process.env.OPENAI_MODEL || 'gpt-4o-mini'),
+    label: 'OpenAI',
+  });
+}
+
+async function completeTextWithDeepSeek(systemPrompt, userMessage, options = {}) {
+  const cfg = getDeepSeekConfig(options);
+  if (!cfg.apiKey) return null;
+  return completeTextWithOpenAICompatible(systemPrompt, userMessage, options, {
+    apiKey: cfg.apiKey,
+    baseURL: cfg.baseURL,
+    model: cfg.model,
+    label: cfg.label,
+  });
 }
 
 async function completeTextWithGoogle(systemPrompt, userMessage, options = {}) {
@@ -758,16 +942,22 @@ async function completeTextWithGoogle(systemPrompt, userMessage, options = {}) {
  * Plain-text LLM completion for help chat (not JSON). Uses same provider order as complete().
  */
 async function completeText(systemPrompt, userMessage, options = {}) {
-  return withModelLock(async () => {
+  return withModelLock(
+    async () => {
     const providerPref = cleanEnvValue(process.env.LLM_PROVIDER || '').toLowerCase();
     const maxAttempts = Math.min(3, LLM_MAX_RETRIES);
 
     async function tryOnce() {
       if (providerPref === 'google') return completeTextWithGoogle(systemPrompt, userMessage, options);
       if (providerPref === 'openai') return completeTextWithOpenAI(systemPrompt, userMessage, options);
+      if (providerPref === 'deepseek') return completeTextWithDeepSeek(systemPrompt, userMessage, options);
       if (providerPref === 'ollama') return completeTextWithOllama(systemPrompt, userMessage, options);
       if (cleanEnvValue(process.env.GOOGLE_API_KEY || process.env.GEMINI_API_KEY)) {
         const r = await completeTextWithGoogle(systemPrompt, userMessage, options);
+        if (r) return r;
+      }
+      if (hasDeepSeekKey()) {
+        const r = await completeTextWithDeepSeek(systemPrompt, userMessage, options);
         if (r) return r;
       }
       if (cleanEnvValue(process.env.OPENAI_API_KEY)) {
@@ -797,7 +987,20 @@ async function completeText(systemPrompt, userMessage, options = {}) {
       if (attempt < maxAttempts) await delay(LLM_RETRY_DELAY_MS);
     }
     return null;
+  }, {
+    agent: options.agent || 'help_chat',
+    context: options.context || 'help_chat',
+    projectId: options.projectId,
   });
 }
 
-module.exports = { readPrompt, complete, completeText, OLLAMA_TOOLS };
+module.exports = {
+  readPrompt,
+  complete,
+  completeText,
+  OLLAMA_TOOLS,
+  agentLlmTimeoutMs,
+  getDeepSeekConfig,
+  hasDeepSeekKey,
+  getLlmQueueStatus,
+};

@@ -16,6 +16,10 @@ const router = express.Router();
 
 const { buildAllProjectMetrics } = require('../services/metrics');
 const { buildAgentContext } = require('../services/retrieval');
+const {
+  buildOrgPeopleRoster,
+  sanitizePeopleInsights,
+} = require('../services/orgPeopleInsights');
 const { readPrompt, complete } = require('../lib/llm');
 const agentActivityLog = require('../lib/agentActivityLog');
 
@@ -36,13 +40,28 @@ function loadStore() {
   try {
     const eventsRouter = require('./events');
     const store = typeof eventsRouter.getStore === 'function' ? eventsRouter.getStore() : null;
+    const people =
+      typeof eventsRouter.loadPeople === 'function' ? eventsRouter.loadPeople() : [];
     if (store && Array.isArray(store.eventLog)) {
-      return { events: store.eventLog, projects: store.projects || {} };
+      return { events: store.eventLog, projects: store.projects || {}, people };
     }
   } catch (err) {
     console.error('orgInsights: failed to load store', err.message);
   }
-  return { events: [], projects: {} };
+  return { events: [], projects: {}, people: [] };
+}
+
+function peopleByIdFromList(people) {
+  return new Map((people || []).map((p) => [p.id, p]));
+}
+
+function applyPeopleInsightSanitize(insights, people) {
+  if (!insights || !Array.isArray(insights.peopleInsights)) return insights;
+  const byId = peopleByIdFromList(people);
+  return {
+    ...insights,
+    peopleInsights: sanitizePeopleInsights(insights.peopleInsights, byId),
+  };
 }
 
 function buildStubInsights(metrics) {
@@ -101,8 +120,9 @@ async function computeInsightsOnce() {
   if (backgroundRunning) return;
   backgroundRunning = true;
   try {
-    const { events, projects } = loadStore();
+    const { events, projects, people } = loadStore();
     const metrics = buildAllProjectMetrics(projects, events);
+    const orgPeopleRoster = buildOrgPeopleRoster(people, metrics);
     const orgPrompt = readPrompt('orgAI');
     if (!orgPrompt) {
       latestInsights = buildStubInsights(metrics);
@@ -115,18 +135,23 @@ async function computeInsightsOnce() {
       return;
     }
 
-    const agentContext = buildAgentContext('org_ai', null, { metrics, projects }, {
+    const agentContext = buildAgentContext('org_ai', null, { metrics, projects, orgPeopleRoster }, {
       eventLog: events,
       projects,
-      people: [],
+      people,
       metrics,
     });
     const input = {
       agentContext,
       projects: metrics.projects,
+      orgPeopleRoster,
     };
     // LLM receives only agentContext; projectInsights must reference only metrics.projects.
-    const result = await complete(orgPrompt, JSON.stringify(input), { timeoutMs: 180000 });
+    const result = await complete(orgPrompt, JSON.stringify(input), {
+      timeoutMs: 180000,
+      agent: 'org_ai',
+      context: 'org_insights',
+    });
     if (result && typeof result === 'object') {
       const rawProject = Array.isArray(result.projectInsights) ? result.projectInsights : [];
       const validProjectIds = new Set((metrics.projects || []).map((m) => m.projectId));
@@ -138,7 +163,10 @@ async function computeInsightsOnce() {
         return true;
       });
       const rawPeople = Array.isArray(result.peopleInsights) ? result.peopleInsights : [];
-      latestInsights = { projectInsights, peopleInsights: rawPeople };
+      latestInsights = applyPeopleInsightSanitize(
+        { projectInsights, peopleInsights: rawPeople },
+        people
+      );
       latestInsightsAt = new Date().toISOString();
       agentActivityLog.push({
         source: 'org_ai',
@@ -167,19 +195,28 @@ setTimeout(() => {
 }, 1000);
 
 router.get('/', async (req, res) => {
-  const { events, projects } = loadStore();
+  const { events, projects, people } = loadStore();
   const metrics = buildAllProjectMetrics(projects, events);
 
-  const baseInsights = latestInsights || buildStubInsights(metrics);
+  const baseInsights = applyPeopleInsightSanitize(
+    latestInsights || buildStubInsights(metrics),
+    people
+  );
 
   // Ensure we never show insights for projects that no longer exist in the store.
   const validProjectIds = new Set((metrics.projects || []).map((m) => m.projectId));
   let filteredInsights = baseInsights;
   if (baseInsights && Array.isArray(baseInsights.projectInsights)) {
     const seen = new Set();
+    const operationalIds = new Set(
+      Object.entries(projects || {})
+        .filter(([, st]) => (st?.status || 'active') === 'active' && !st?.archived)
+        .map(([id]) => id)
+    );
     const projectInsights = baseInsights.projectInsights.filter((p) => {
       const id = p?.projectId ?? p?.project_id;
       if (!id || !validProjectIds.has(id) || seen.has(id)) return false;
+      if (!operationalIds.has(id)) return false;
       seen.add(id);
       return true;
     });

@@ -10,6 +10,8 @@ const SESSION_KEY = 'worker-portal-person-id';
 const THEME_KEY = 'worker-portal-theme';
 const LEADERSHIP_URL =
   import.meta.env.VITE_LEADERSHIP_URL || 'http://localhost:5173';
+const MONITOR_URL =
+  import.meta.env.VITE_MONITOR_PORTAL_URL || 'http://localhost:5175';
 
 const API_WORKER = '/worker';
 
@@ -257,9 +259,19 @@ function TaskCard({ task, personId, onUpdated }) {
 
 const HANDLING_LABELS = { ai: 'AI agents', notify: 'Notify teams', self: 'Self-manage' };
 
+const DEFAULT_MODE_BY_KIND = {
+  sick_leave: 'ai',
+  vacation: 'ai',
+  workload_concern: 'notify',
+  blocker_escalation: 'notify',
+  project_transfer: 'notify',
+  schedule_change: 'ai',
+  general: 'notify',
+};
+
 function RequestForm({ dashboard, personId, onSubmitted }) {
   const [kind, setKind] = useState('general');
-  const [handlingMode, setHandlingMode] = useState('notify');
+  const [handlingMode, setHandlingMode] = useState(DEFAULT_MODE_BY_KIND.general);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [projectId, setProjectId] = useState('org-general');
@@ -332,7 +344,14 @@ function RequestForm({ dashboard, personId, onSubmitted }) {
       </fieldset>
       <label className="worker-label">
         Request type
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+        <select
+          value={kind}
+          onChange={(e) => {
+            const next = e.target.value;
+            setKind(next);
+            setHandlingMode(DEFAULT_MODE_BY_KIND[next] || 'notify');
+          }}
+        >
           {kinds.map((k) => (
             <option key={k.id} value={k.id}>
               {k.label}
@@ -426,7 +445,16 @@ function RequestRow({ r }) {
           AI tasks: {r.roleAssignments.map((a) => `${a.roleLabel || 'review'} → ${a.assigneeName || a.assigneeId}`).join('; ')}
         </p>
       )}
-      {r.reviewedByName && ['approved', 'rejected', 'met'].includes(r.status) && (
+      {r.aiHandlerWatching && r.status !== 'approved' && (
+        <p className="worker-muted">AI Handler is monitoring — {r.aiHandlerOversightReason || 'awaiting team review'}.</p>
+      )}
+      {r.oversight && (
+        <p className="worker-muted">Oversight: {r.oversight.reason || r.oversight.action}</p>
+      )}
+      {(r.aiAutoApproved || r.handlingMode === 'ai') && r.status === 'approved' && (
+        <p className="worker-ok">Handled autonomously by {r.reviewedByName || r.autoApprovedByName || 'Org AI'}</p>
+      )}
+      {r.reviewedByName && ['approved', 'rejected', 'met'].includes(r.status) && !r.aiAutoApproved && (
         <p className="worker-ok">
           {r.status} by {r.reviewedByName}
           {r.reviewNotes ? ` — ${r.reviewNotes}` : ''}
@@ -525,18 +553,22 @@ function ProjectReviewInbox({ personId, onUpdated }) {
           <li key={r.id} className="worker-hr-item">
             <RequestRow r={r} />
             <p className="worker-muted">From: {r.submitterName || r.submitterId}</p>
-            <RequestReviewActions
-              requestId={r.id}
-              personId={personId}
-              notes={notes}
-              setNotes={setNotes}
-              onDone={() => {
-                load();
-                onUpdated();
-              }}
-              msg={msg}
-              setMsg={setMsg}
-            />
+            {r.handlingMode === 'ai' || r.aiAutoApproved ? (
+              <p className="worker-muted">This request was handled autonomously by Org AI.</p>
+            ) : (
+              <RequestReviewActions
+                requestId={r.id}
+                personId={personId}
+                notes={notes}
+                setNotes={setNotes}
+                onDone={() => {
+                  load();
+                  onUpdated();
+                }}
+                msg={msg}
+                setMsg={setMsg}
+              />
+            )}
           </li>
         ))}
       </ul>
@@ -665,12 +697,198 @@ function HrEmergencyPanel({ personId, onUpdated }) {
   );
 }
 
+const HR_HIRE_PROFILES = [
+  { id: 'data', label: 'Data / ML' },
+  { id: 'engineering', label: 'Engineering' },
+  { id: 'legal', label: 'Legal' },
+  { id: 'security', label: 'Security' },
+  { id: 'ai', label: 'AI/ML' },
+  { id: 'hr', label: 'Human Resources' },
+  { id: 'finance', label: 'Finance' },
+  { id: 'marketing', label: 'Marketing' },
+];
+
+function HrHiringPanel({ personId, onUpdated, draft }) {
+  const [profileId, setProfileId] = useState(draft?.profileId || 'data');
+  const [requirements, setRequirements] = useState(draft?.requirements || '');
+  const [projectId, setProjectId] = useState(draft?.projectId || '');
+  const [linkedNeedId, setLinkedNeedId] = useState(draft?.needId || '');
+  const [preview, setPreview] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState(null);
+
+  useEffect(() => {
+    if (!draft) return;
+    if (draft.profileId) setProfileId(draft.profileId);
+    if (draft.requirements) setRequirements(draft.requirements);
+    if (draft.projectId) setProjectId(draft.projectId);
+    if (draft.needId) setLinkedNeedId(draft.needId);
+  }, [draft]);
+
+  const bodyBase = () => ({
+    hrPersonId: personId,
+    needId: linkedNeedId || undefined,
+    correlationId: linkedNeedId || undefined,
+  });
+
+  async function generatePreview(matchRequirements = false) {
+    setLoading(true);
+    setMsg(null);
+    try {
+      const data = await fetchJson(`${API_WORKER}/hr/generate-mock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...bodyBase(),
+          profileId: profileId || undefined,
+          requirements: requirements.trim() || undefined,
+          description: requirements.trim() || undefined,
+          matchRequirements,
+        }),
+      });
+      setPreview(data);
+      setMsg(matchRequirements ? 'Best-match candidate (preview).' : 'Random candidate (preview).');
+    } catch (e) {
+      setMsg(e.message);
+      setPreview(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function hirePreview() {
+    if (!preview?.person) return;
+    setLoading(true);
+    setMsg(null);
+    try {
+      const data = await fetchJson(`${API_WORKER}/hr/hire`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...bodyBase(),
+          person: preview.person,
+          projectId: projectId.trim() || undefined,
+          requirements: requirements.trim() || undefined,
+        }),
+      });
+      setMsg(`Hired ${data.person?.name} (${data.person?.id})${data.teamMember ? ' — on project team' : ''}.`);
+      setPreview(null);
+      onUpdated?.();
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function hireForRequirements() {
+    setLoading(true);
+    setMsg(null);
+    try {
+      const data = await fetchJson(`${API_WORKER}/hr/hire-for-requirements`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...bodyBase(),
+          profileId: profileId || undefined,
+          requirements: requirements.trim(),
+          description: requirements.trim(),
+          projectId: projectId.trim() || undefined,
+        }),
+      });
+      setMsg(
+        `Hired ${data.person?.name} (match ${data.matchScore ?? '—'})${data.teamMember ? ' — on project team' : ''}.`
+      );
+      setPreview(null);
+      onUpdated?.();
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="worker-hr-hiring">
+      <h3>Hiring — mock employee generator</h3>
+      <p className="worker-muted">
+        Generate candidates, preview fit, and add to the database. AI Handler auto-hires when possible; otherwise
+        requirements appear in the hiring queue below.
+      </p>
+      {linkedNeedId && (
+        <p className="worker-muted">Linked to hiring need: {linkedNeedId}</p>
+      )}
+      <div className="worker-hr-hiring-form">
+        <label className="worker-label">
+          Profile
+          <select value={profileId} onChange={(e) => setProfileId(e.target.value)}>
+            {HR_HIRE_PROFILES.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="worker-label">
+          Requirements (optional)
+          <textarea
+            rows={2}
+            placeholder="e.g. data science specialist for legal case analysis"
+            value={requirements}
+            onChange={(e) => setRequirements(e.target.value)}
+          />
+        </label>
+        <label className="worker-label">
+          Add to project (optional)
+          <input
+            type="text"
+            placeholder="proj-organize-company-legal-cases"
+            value={projectId}
+            onChange={(e) => setProjectId(e.target.value)}
+          />
+        </label>
+      </div>
+      <div className="worker-btn-group worker-btn-group--wrap">
+        <button type="button" className="worker-btn worker-btn--secondary" disabled={loading} onClick={() => generatePreview(false)}>
+          Random preview
+        </button>
+        <button type="button" className="worker-btn worker-btn--secondary" disabled={loading} onClick={() => generatePreview(true)}>
+          Match preview
+        </button>
+        <button type="button" className="worker-btn worker-btn--primary" disabled={loading || !preview?.person} onClick={hirePreview}>
+          Hire preview
+        </button>
+        <button type="button" className="worker-btn worker-btn--success" disabled={loading} onClick={hireForRequirements}>
+          Hire for requirements
+        </button>
+      </div>
+      {msg && <p className={msg.startsWith('Hired') ? 'worker-ok' : 'worker-error'}>{msg}</p>}
+      {preview?.person && (
+        <div className="worker-hr-hiring-preview">
+          <h4>Preview</h4>
+          <p>
+            <strong>{preview.person.name}</strong> — {preview.person.role}
+          </p>
+          <p className="worker-muted">
+            {preview.person.id} · {preview.person.department} / {preview.person.team}
+          </p>
+          <p className="worker-muted">Skills: {(preview.person.skills || []).join(', ')}</p>
+          {preview.matchScore != null && (
+            <p className="worker-muted">Match score: {preview.matchScore}</p>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function HrInbox({ personId, onUpdated }) {
   const [inbox, setInbox] = useState(null);
   const [loading, setLoading] = useState(true);
   const [notes, setNotes] = useState({});
   const [taskTitle, setTaskTitle] = useState({});
   const [msg, setMsg] = useState(null);
+  const [hiringDraft, setHiringDraft] = useState(null);
 
   const load = useCallback(() => {
     setLoading(true);
@@ -746,20 +964,24 @@ function HrInbox({ personId, onUpdated }) {
                 placeholder="Optional message to employee"
               />
             </label>
-            <div className="worker-btn-group worker-btn-group--wrap">
-              <button type="button" className="worker-btn worker-btn--secondary" onClick={() => review(r.id, 'in_review')}>
-                In review
-              </button>
-              <button type="button" className="worker-btn worker-btn--success" onClick={() => review(r.id, 'approved')}>
-                Approve
-              </button>
-              <button type="button" className="worker-btn worker-btn--danger" onClick={() => review(r.id, 'rejected')}>
-                Reject
-              </button>
-              <button type="button" className="worker-btn worker-btn--ghost" onClick={() => review(r.id, 'met')}>
-                Close
-              </button>
-            </div>
+            {r.handlingMode === 'ai' || r.aiAutoApproved ? (
+              <p className="worker-muted">Handled autonomously by Org AI — no HR approval required.</p>
+            ) : (
+              <div className="worker-btn-group worker-btn-group--wrap">
+                <button type="button" className="worker-btn worker-btn--secondary" onClick={() => review(r.id, 'in_review')}>
+                  In review
+                </button>
+                <button type="button" className="worker-btn worker-btn--success" onClick={() => review(r.id, 'approved')}>
+                  Approve
+                </button>
+                <button type="button" className="worker-btn worker-btn--danger" onClick={() => review(r.id, 'rejected')}>
+                  Reject
+                </button>
+                <button type="button" className="worker-btn worker-btn--ghost" onClick={() => review(r.id, 'met')}>
+                  Close
+                </button>
+              </div>
+            )}
             <label className="worker-label">
               Issue HR task
               <input
@@ -775,6 +997,50 @@ function HrInbox({ personId, onUpdated }) {
         ))}
       </ul>
       {inbox.inbox.length === 0 && <p className="worker-muted">No open worker requests.</p>}
+
+      {(inbox.hiringQueue?.length > 0 || hiringDraft) && (
+        <section className="worker-hr-hiring-queue">
+          <h3>Hiring queue (AI Handler)</h3>
+          <p className="worker-muted">
+            Staffing or expertise gaps the system could not fill from the current roster. Use the generator below or hire
+            for requirements.
+          </p>
+          <ul className="worker-request-list">
+            {(inbox.hiringQueue || []).map((item) => (
+              <li key={item.id} className="worker-hr-hiring-queue-item">
+                <strong>{item.title}</strong>
+                <span className="worker-req-kind">{item.hiringStatus || 'pending_hr'}</span>
+                <p className="worker-muted">{item.projectId}</p>
+                {item.hiringRequirements && (
+                  <pre className="worker-hiring-req">{item.hiringRequirements}</pre>
+                )}
+                {item.hiringError && <p className="worker-error">Auto-hire: {item.hiringError}</p>}
+                {item.hiredPersonName && (
+                  <p className="worker-ok">Hired: {item.hiredPersonName}</p>
+                )}
+                {item.hiringStatus !== 'hired' && (
+                  <button
+                    type="button"
+                    className="worker-btn worker-btn--primary"
+                    onClick={() =>
+                      setHiringDraft({
+                        needId: item.id,
+                        requirements: item.hiringRequirements || item.description || item.title,
+                        projectId: item.hiringProjectId || item.projectId,
+                        profileId: item.hiringProfileId || 'data',
+                      })
+                    }
+                  >
+                    Open in hiring generator
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      <HrHiringPanel personId={personId} onUpdated={load} draft={hiringDraft} />
       <HrEmergencyPanel personId={personId} onUpdated={onUpdated} />
       {inbox.hrTasks?.length > 0 && (
         <>
@@ -833,7 +1099,26 @@ export default function App() {
     } catch {
       /* ignore */
     }
-  }, [theme]);
+    if (!personId) return;
+    const base = import.meta.env.VITE_API_URL || '/api';
+    fetch(`${base}/preferences`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ personId, preferences: { theme } }),
+    }).catch(() => {});
+  }, [theme, personId]);
+
+  useEffect(() => {
+    if (!personId) return;
+    const base = import.meta.env.VITE_API_URL || '/api';
+    fetch(`${base}/preferences?personId=${encodeURIComponent(personId)}`)
+      .then((r) => r.json())
+      .then((d) => {
+        const t = d?.preferences?.theme;
+        if (t === 'light' || t === 'dark') setTheme(t);
+      })
+      .catch(() => {});
+  }, [personId]);
 
   useEffect(() => {
     if (!personId) return undefined;
@@ -903,6 +1188,12 @@ export default function App() {
             <p className="worker-role-line">
               {p.role} · {p.department} / {p.team}
             </p>
+            {dashboard.personalHr && (
+              <p className="worker-personal-hr">
+                Your HR partner: <strong>{dashboard.personalHr.name}</strong>
+                {dashboard.personalHr.role ? ` (${dashboard.personalHr.role})` : ''}
+              </p>
+            )}
             {p.availabilityStatus === 'on_leave' && (
               <p className="worker-leave-banner">
                 On leave{p.availabilityUntil ? ` until ${formatDate(p.availabilityUntil)}` : ''}
@@ -1115,6 +1406,7 @@ export default function App() {
 
       <footer className="worker-footer">
         <a href={LEADERSHIP_URL}>Leadership View</a>
+        <a href={MONITOR_URL}>Ops Monitor</a>
         <span>Worker Portal · separate deploy from client/</span>
       </footer>
     </div>

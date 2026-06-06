@@ -4,12 +4,22 @@
 
 const crypto = require('crypto');
 const agentActivityLog = require('../lib/agentActivityLog');
+const { buildReviewTaskId } = require('../lib/reviewTaskIds');
 const { getRoutingForKind, resolveForwardTargets, ROLES } = require('../constants/requestRouting');
 
-async function createReviewTask(needEvent, ctx, assignee, reviewTitle, reviewDesc, submitterName, roleLabel) {
+async function createReviewTask(
+  needEvent,
+  ctx,
+  assignee,
+  reviewTitle,
+  reviewDesc,
+  submitterName,
+  roleLabel,
+  roleId
+) {
   const { emitEvent } = ctx;
   const projectId = needEvent.projectId;
-  const taskId = `wr-${assignee.id.slice(0, 6)}-${needEvent.id.replace(/-/g, '').slice(0, 8)}`;
+  const taskId = buildReviewTaskId(needEvent, roleId || roleLabel);
 
   await emitEvent({
     id: crypto.randomUUID(),
@@ -46,7 +56,13 @@ async function createReviewTask(needEvent, ctx, assignee, reviewTitle, reviewDes
     },
   });
 
-  return { taskId, assigneeId: assignee.id, roleLabel };
+  return {
+    taskId,
+    assigneeId: assignee.id,
+    assigneeName: assignee.name,
+    roleLabel,
+    role: roleId || roleLabel,
+  };
 }
 
 /**
@@ -56,7 +72,11 @@ async function createReviewTask(needEvent, ctx, assignee, reviewTitle, reviewDes
 async function processWorkerRequest(needEvent, ctx) {
   const { emitEvent, loadPeople, getStore } = ctx;
   const handlingMode = needEvent.payload?.handlingMode || 'notify';
-  const { kind, title, personId } = needEvent.payload || {};
+  const { kind, personId } = needEvent.payload || {};
+  const title =
+    needEvent.payload?.title?.trim() ||
+    needEvent.payload?.kind ||
+    'Worker request';
   const people = loadPeople();
   const { projects } = getStore();
   const projectId = needEvent.projectId;
@@ -90,54 +110,17 @@ async function processWorkerRequest(needEvent, ctx) {
   const assignedRoles = new Set();
 
   if (handlingMode === 'ai') {
-    for (const target of forwardTargets) {
-      if (!target.personId) continue;
-      if (assignedRoles.has(target.role)) continue;
-      const assignee = people.find((p) => p.id === target.personId);
-      if (!assignee) continue;
-      assignedRoles.add(target.role);
-      const result = await createReviewTask(
-        needEvent,
-        ctx,
-        assignee,
-        `[${target.roleLabel}] ${reviewTitle}`,
-        reviewDesc,
-        submitterName,
-        target.roleLabel
-      );
-      assignments.push({
-        ...result,
-        role: target.role,
-        agent: target.agent,
-        assigneeName: assignee.name,
-      });
-      agentActivityLog.push({
-        source: target.agent || 'team_builder',
-        projectId,
-        message: `AI assigned ${target.roleLabel} review to ${assignee.name} for "${title}".`,
-      });
-    }
-    if (assignments.length === 0) {
-      agentActivityLog.push({
-        source: 'orchestrator',
-        projectId,
-        message: `AI could not resolve role assignees for "${title}"; check people directory.`,
-      });
-    } else {
-      needEvent.payload.aiHandled = true;
-      needEvent.payload.roleAssignments = assignments;
-      needEvent.payload.primaryReviewerPersonIds = assignments.map((a) => a.assigneeId);
-      const hrAssign = assignments.find((a) => forwardTargets.find((t) => t.personId === a.assigneeId && t.role === 'hr'));
-      if (hrAssign) needEvent.payload.assignedHrPersonId = hrAssign.assigneeId;
-      const projAssign = assignments.find((a) =>
-        forwardTargets.find((t) => t.personId === a.assigneeId && t.role !== 'hr')
-      );
-      if (projAssign) {
-        needEvent.payload.assignedReviewerPersonId = projAssign.assigneeId;
-        needEvent.payload.projectReviewTaskId = projAssign.taskId;
-      }
-      needEvent.payload.status = 'in_review';
-    }
+    const hrTarget = forwardTargets.find((t) => t.role === 'hr' && t.personId);
+    if (hrTarget) needEvent.payload.assignedHrPersonId = hrTarget.personId;
+    const nonHr = forwardTargets.find((t) => t.role !== 'hr' && t.personId);
+    if (nonHr) needEvent.payload.assignedReviewerPersonId = nonHr.personId;
+    needEvent.payload.aiHandled = true;
+    needEvent.payload.status = 'open';
+    agentActivityLog.push({
+      source: 'ai_handler',
+      projectId,
+      message: `AI Handler evaluating "${title}" — autonomous approval only if oversight policy allows.`,
+    });
   }
 
   if (handlingMode === 'notify' || handlingMode === 'self') {
@@ -166,6 +149,35 @@ async function processWorkerRequest(needEvent, ctx) {
         message: `${submitterName} self-managing "${title}"; roles notified: ${routing.forwardsTo}.`,
       });
     }
+
+    const reviewerRoles = new Set(['hr', 'project_lead', 'engineering_mgmt', 'finance', 'legal']);
+    for (const target of forwardTargets) {
+      if (!target.personId || !reviewerRoles.has(target.role)) continue;
+      if (assignedRoles.has(target.role)) continue;
+      assignedRoles.add(target.role);
+      const assignee = people.find((p) => p.id === target.personId);
+      if (!assignee) continue;
+      try {
+        const a = await createReviewTask(
+          needEvent,
+          ctx,
+          assignee,
+          reviewTitle,
+          reviewDesc,
+          submitterName,
+          target.roleLabel,
+          target.role
+        );
+        assignments.push(a);
+      } catch (err) {
+        console.warn('[workerRequest] review task skipped:', err.message);
+      }
+    }
+
+    if (assignments.length) {
+      needEvent.payload.roleAssignments = assignments;
+    }
+
     if (forwardTargets.some((t) => t.personId)) {
       needEvent.payload.primaryReviewerPersonIds = forwardTargets
         .filter((t) => t.personId && t.role !== 'project_team')
@@ -179,4 +191,4 @@ async function processWorkerRequest(needEvent, ctx) {
   return { forwardTargets, routing, handlingMode, assignments };
 }
 
-module.exports = { processWorkerRequest };
+module.exports = { processWorkerRequest, createReviewTask };

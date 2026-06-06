@@ -544,6 +544,50 @@ body {
   border-radius: 6px;
   display: inline-block;
 }
+.worker-hr-hiring {
+  margin: 1.25rem 0;
+  padding: 1rem;
+  border: 1px solid var(--border-mid, rgba(255, 255, 255, 0.12));
+  border-radius: 8px;
+  background: var(--surface-elevated, rgba(255, 255, 255, 0.03));
+}
+.worker-hr-hiring-form {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0.75rem 0;
+}
+.worker-hr-hiring-form textarea {
+  width: 100%;
+  min-height: 3.5rem;
+  resize: vertical;
+}
+.worker-hr-hiring-preview {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border, rgba(255, 255, 255, 0.07));
+}
+.worker-hr-hiring-queue {
+  margin: 1.25rem 0;
+  padding: 1rem;
+  border: 1px solid rgba(0, 176, 240, 0.25);
+  border-radius: 8px;
+  background: rgba(0, 176, 240, 0.06);
+}
+.worker-hr-hiring-queue-item {
+  margin-bottom: 1rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border, rgba(255, 255, 255, 0.07));
+}
+.worker-hiring-req {
+  font-size: 0.78rem;
+  white-space: pre-wrap;
+  margin: 0.5rem 0;
+  padding: 0.5rem;
+  background: var(--surface-elevated, rgba(255, 255, 255, 0.04));
+  border-radius: 6px;
+  max-height: 8rem;
+  overflow: auto;
+}
 .worker-hr-emergency {
   margin: 1.25rem 0;
   padding: 1rem;

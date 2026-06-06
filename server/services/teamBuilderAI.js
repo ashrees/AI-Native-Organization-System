@@ -3,7 +3,7 @@
  * Must provide rationale for every assignment. Uses OpenAI when OPENAI_API_KEY is set; otherwise stub.
  */
 
-const { readPrompt, complete, OLLAMA_TOOLS } = require('../lib/llm');
+const { readPrompt, complete, OLLAMA_TOOLS, agentLlmTimeoutMs } = require('../lib/llm');
 
 // --- Task type classification (for deterministic assignment) ---
 const TASK_TYPES = Object.freeze({
@@ -279,8 +279,12 @@ function peopleAvailableForAssignment(people) {
 async function assignTask(task, people, projectContext = null, options = {}) {
   const availablePeople = peopleAvailableForAssignment(people);
   if (!availablePeople || availablePeople.length === 0) {
-    const stub = stubAssign(task, people, projectContext, options);
-    return { ...stub, _usedStub: true };
+    return {
+      personId: null,
+      rationale: 'No active people available (all on leave or unavailable).',
+      _usedStub: true,
+      _failReason: 'no_active_people',
+    };
   }
 
   const { people: filteredPeople, note: filterNote } = filterPeopleByRequiredDepartments(task, availablePeople);
@@ -328,17 +332,19 @@ async function assignTask(task, people, projectContext = null, options = {}) {
   );
 
   const defaultTimeoutMs =
-    String(process.env.LLM_PROVIDER || '').toLowerCase() === 'ollama' ? 60000 : 2500;
+    agentLlmTimeoutMs();
   const timeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS || defaultTimeoutMs);
   const out = await complete(systemPrompt, userMessage, {
     timeoutMs,
     tools: OLLAMA_TOOLS.teamBuilder,
     agent: 'team_builder',
     projectId: projectContext?.id || undefined,
+    projectTitle: projectContext?.title || undefined,
     context: {
       kind: 'assignTask',
       taskId: task?.id,
     },
+    taskId: task?.id,
   });
   const rationale = typeof out?.rationale === 'string'
     ? out.rationale.trim()
@@ -431,4 +437,4 @@ async function assignTask(task, people, projectContext = null, options = {}) {
   };
 }
 
-module.exports = { assignTask, stubAssign };
+module.exports = { assignTask, stubAssign, peopleAvailableForAssignment };

@@ -4,7 +4,10 @@
   "private": true,
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test:team-member": "node scripts/test-worker-request-team-member.js",
+    "generate:employee": "node scripts/generate-mock-employee.js",
+    "npc:tick": "node scripts/mock-worker-npc-tick.js"
   },
   "dependencies": {
     "dotenv": "^16.4.0",

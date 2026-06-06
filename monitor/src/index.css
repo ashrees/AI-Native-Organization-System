@@ -1,0 +1,144 @@
+/* Operations Monitor — standalone theme (monitor/) */
+
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700&family=DM+Sans:wght@400;500&family=DM+Mono:wght@400;500&display=swap');
+
+:root,
+[data-theme='dark'] {
+  --bg: #050a12;
+  --surface: #0c1420;
+  --surface-2: #111c2e;
+  --surface-3: #182438;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-mid: rgba(255, 255, 255, 0.14);
+  --text: #e8f0fe;
+  --text-secondary: #a8bdd4;
+  --text-muted: #6a8aab;
+  --accent: #00b0f0;
+  --accent-dim: rgba(0, 176, 240, 0.15);
+  --green: #00d68f;
+  --green-dim: rgba(0, 214, 143, 0.12);
+  --yellow: #ffca28;
+  --red: #ff4d6d;
+  --red-dim: rgba(255, 77, 109, 0.12);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --btn-fg: #050a12;
+}
+
+[data-theme='light'] {
+  --bg: #e8eef6;
+  --surface: #fff;
+  --surface-2: #f4f8fc;
+  --surface-3: #e8eef6;
+  --border: rgba(0, 51, 112, 0.12);
+  --border-mid: rgba(0, 51, 112, 0.2);
+  --text: #0a1628;
+  --text-secondary: #3d5568;
+  --text-muted: #5a7289;
+  --accent: #0088c2;
+  --accent-dim: rgba(0, 136, 194, 0.12);
+  --green: #00875a;
+  --green-dim: rgba(0, 135, 90, 0.1);
+  --yellow: #b8860b;
+  --red: #c41e3a;
+  --red-dim: rgba(196, 30, 58, 0.1);
+  --btn-fg: #fff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+.monitor-app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 1rem 1.25rem 2.5rem;
+}
+
+.monitor-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.monitor-header h1 {
+  margin: 0;
+  font-family: Sora, sans-serif;
+  font-size: 1.45rem;
+  font-weight: 700;
+}
+
+.monitor-subtitle {
+  margin: 0.25rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.monitor-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.monitor-portal-link {
+  font-size: 0.82rem;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius-sm);
+}
+
+.monitor-portal-link:hover {
+  background: var(--accent-dim);
+}
+
+.monitor-theme-btn {
+  font-size: 0.82rem;
+  padding: 0.35rem 0.65rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-mid);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.monitor-empty,
+.monitor-error {
+  margin: 2rem 0;
+  text-align: center;
+  color: var(--text-muted);
+}
+
+.monitor-error {
+  color: var(--red);
+}
+
+.monitor-btn-secondary {
+  font-size: 0.82rem;
+  padding: 0.4rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-mid);
+  background: var(--surface-2);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.monitor-btn-secondary:hover {
+  border-color: var(--accent);
+}

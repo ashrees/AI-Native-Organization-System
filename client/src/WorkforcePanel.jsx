@@ -3,6 +3,7 @@
  */
 
 import { useState, useMemo } from 'react';
+import HiringPanel from './HiringPanel';
 
 function scoreColor(score) {
   if (score >= 75) return 'wf-score--high';
@@ -176,7 +177,7 @@ function WorkerDetail({ worker }) {
   );
 }
 
-export default function WorkforcePanel({ data, loading, error }) {
+export default function WorkforcePanel({ data, loading, error, apiBase, onHired, onError }) {
   const [selectedId, setSelectedId] = useState('');
   const [deptFilter, setDeptFilter] = useState('');
   const [sortBy, setSortBy] = useState('overall');
@@ -347,6 +348,8 @@ export default function WorkforcePanel({ data, loading, error }) {
           <WorkerDetail worker={selected} />
         </section>
       </div>
+
+      <HiringPanel apiBase={apiBase} onHired={onHired} onError={onError} />
 
       <section className="wf-section wf-methodology">
         <h3>How scores are calculated</h3>

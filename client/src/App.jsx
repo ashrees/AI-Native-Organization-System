@@ -9,10 +9,15 @@
 import { useState, useEffect, useCallback } from 'react';
 import HelpChat from './HelpChat';
 import WorkforcePanel from './WorkforcePanel';
+import ProjectsPanel from './ProjectsPanel';
+import RevenuePanel from './RevenuePanel';
+import { logMessageShort, isRecentChangeEvent, recentEventSummary } from './recentEvents';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 const WORKER_PORTAL_URL =
   import.meta.env.VITE_WORKER_PORTAL_URL || 'http://localhost:5174';
+const MONITOR_PORTAL_URL =
+  import.meta.env.VITE_MONITOR_PORTAL_URL || 'http://localhost:5175';
 const THEME_STORAGE_KEY = 'leadership-view-theme';
 
 function getStoredTheme() {
@@ -47,46 +52,6 @@ function randomUUID() {
   });
 }
 
-/** Log display: show at most 2 sentences for agent messages. */
-function logMessageShort(text, maxSentences = 2) {
-  if (text == null || typeof text !== 'string') return '';
-  const t = text.trim();
-  if (!t) return '';
-  const sentences = t.split(/(?<=[.!?])\s+/).map((s) => s.trim()).filter(Boolean);
-  if (sentences.length <= maxSentences) return t;
-  return sentences.slice(0, maxSentences).join(' ');
-}
-
-/** Event types shown under "What changed recently" (excludes assignment/plan noise). */
-function isRecentChangeEvent(event) {
-  return ['execution', 'decision', 'unassignment'].includes(event.type);
-}
-
-function recentEventSummary(event, project) {
-  const direct = event.rationale || event.message;
-  if (direct) return logMessageShort(direct);
-  const p = event.payload || {};
-  if (event.type === 'execution' && p.taskId) {
-    const task = (project?.progress?.tasks || []).find((t) => t.id === p.taskId);
-    const title = task?.title || p.taskId;
-    const statusLabel = String(p.status || 'updated').replace(/_/g, ' ');
-    let msg = `Task "${title}" marked ${statusLabel}`;
-    if (p.notes) msg += `: ${p.notes}`;
-    return logMessageShort(msg);
-  }
-  if (event.type === 'decision' && p.decisionType === 'assignment_gap_fill') {
-    const n = p.assignedCount ?? 0;
-    return logMessageShort(
-      event.rationale ||
-        `Assignment gap fill: ${n} unassigned task(s) assigned by Team Builder.`
-    );
-  }
-  if (p.reason) return logMessageShort(String(p.reason));
-  if (p.summary) return logMessageShort(String(p.summary));
-  if (p.description) return logMessageShort(String(p.description));
-  return '';
-}
-
 export default function App() {
   const [theme, setTheme] = useState(getStoredTheme);
   const [projects, setProjects] = useState([]);
@@ -104,9 +69,15 @@ export default function App() {
   const [llmLoading, setLlmLoading] = useState(false);
   const [needs, setNeeds] = useState([]);
   const [needsLoading, setNeedsLoading] = useState(false);
+  const [pendingNeedsCount, setPendingNeedsCount] = useState(0);
+  const [aiHandlerAutomatic, setAiHandlerAutomatic] = useState(false);
+  const [aiHandlerSaving, setAiHandlerSaving] = useState(false);
   const [workforce, setWorkforce] = useState(null);
   const [workforceLoading, setWorkforceLoading] = useState(false);
   const [workforceError, setWorkforceError] = useState(null);
+  const [revenue, setRevenue] = useState(null);
+  const [revenueLoading, setRevenueLoading] = useState(false);
+  const [revenueError, setRevenueError] = useState(null);
 
   const load = useCallback(async () => {
     try {
@@ -154,7 +125,47 @@ export default function App() {
     } catch {
       /* ignore */
     }
+    fetch(`${API_BASE}/preferences`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ personId: 'leadership', preferences: { theme } }),
+    }).catch(() => {});
   }, [theme]);
+
+  const refreshNeeds = useCallback(async () => {
+    try {
+      const [summary, data] = await Promise.all([
+        fetchJson('/events/needs/summary'),
+        fetchJson('/events/needs'),
+      ]);
+      setPendingNeedsCount(summary.pending ?? 0);
+      if (summary.aiHandlerAutomatic != null) setAiHandlerAutomatic(!!summary.aiHandlerAutomatic);
+      const list = (data.needs || []).slice().sort((a, b) => {
+        const pending = (s) => (['open', 'in_review'].includes(s) ? 0 : 1);
+        const pa = pending(a.status);
+        const pb = pending(b.status);
+        if (pa !== pb) return pa - pb;
+        return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
+      });
+      setNeeds(list);
+    } catch {
+      /* best-effort */
+    }
+  }, []);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/preferences?personId=leadership`)
+      .then((r) => r.json())
+      .then((d) => {
+        const t = d?.preferences?.theme;
+        if (t === 'light' || t === 'dark') setTheme(t);
+        const ah = d?.preferences?.aiHandlerAutomatic;
+        if (ah === true || ah === 'true') setAiHandlerAutomatic(true);
+        if (ah === false || ah === 'false') setAiHandlerAutomatic(false);
+      })
+      .catch(() => {});
+    refreshNeeds();
+  }, [refreshNeeds]);
 
   const toggleTheme = () => {
     setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
@@ -194,11 +205,33 @@ export default function App() {
             .then(setWorkforce)
             .catch((e) => setWorkforceError(e.message));
         }
+        if (activeTab === 'revenue') {
+          fetchJson('/revenue/analytics')
+            .then(setRevenue)
+            .catch((e) => setRevenueError(e.message));
+        }
       }, 350);
     };
 
     const es = new EventSource(`${API_BASE}/events/stream`);
-    es.addEventListener('event', scheduleRefresh);
+    es.addEventListener('event', (ev) => {
+      scheduleRefresh();
+      try {
+        const data = JSON.parse(ev.data || '{}');
+        if (data.type === 'need') refreshNeeds();
+      } catch {
+        /* ignore */
+      }
+    });
+    es.addEventListener('needs', (ev) => {
+      try {
+        const data = JSON.parse(ev.data || '{}');
+        if (typeof data.pending === 'number') setPendingNeedsCount(data.pending);
+        if (activeTab === 'needs') refreshNeeds();
+      } catch {
+        /* ignore */
+      }
+    });
     es.addEventListener('ready', () => {});
     es.onerror = () => {
       // If SSE drops, the UI still works; user can refresh or we can add polling later.
@@ -208,7 +241,7 @@ export default function App() {
       if (timer) clearTimeout(timer);
       es.close();
     };
-  }, [load, activeTab]);
+  }, [load, activeTab, refreshNeeds]);
 
   useEffect(() => {
     if (activeTab !== 'workforce') return undefined;
@@ -227,6 +260,29 @@ export default function App() {
       })
       .finally(() => {
         if (!cancelled) setWorkforceLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'revenue') return undefined;
+    let cancelled = false;
+    setRevenueLoading(true);
+    setRevenueError(null);
+    fetchJson('/revenue/analytics')
+      .then((data) => {
+        if (!cancelled) setRevenue(data);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setRevenueError(err.message);
+          setRevenue(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setRevenueLoading(false);
       });
     return () => {
       cancelled = true;
@@ -305,26 +361,38 @@ export default function App() {
   }, [activeTab, llmProjectId]);
 
   useEffect(() => {
-    if (activeTab !== 'needs') {
-      setNeeds([]);
-      return;
-    }
+    if (activeTab !== 'needs') return undefined;
     let cancelled = false;
     setNeedsLoading(true);
-    fetchJson('/events/needs')
-      .then((data) => {
-        if (!cancelled) setNeeds(data.needs || []);
-      })
-      .catch(() => {
-        if (!cancelled) setNeeds([]);
-      })
-      .finally(() => {
-        if (!cancelled) setNeedsLoading(false);
-      });
+    refreshNeeds().finally(() => {
+      if (!cancelled) setNeedsLoading(false);
+    });
     return () => {
       cancelled = true;
     };
-  }, [activeTab]);
+  }, [activeTab, refreshNeeds]);
+
+  const setAiHandler = async (enabled) => {
+    setAiHandlerSaving(true);
+    try {
+      await fetch(`${API_BASE}/preferences`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          personId: 'leadership',
+          preferences: { aiHandlerAutomatic: enabled },
+        }),
+      });
+      setAiHandlerAutomatic(enabled);
+      if (enabled) {
+        setTimeout(() => refreshNeeds(), 2500);
+      }
+    } catch (e) {
+      setSubmitStatus(e.message);
+    } finally {
+      setAiHandlerSaving(false);
+    }
+  };
 
   if (loading) return <div className="loading">Loading…</div>;
   if (error) return <div className="error">Error: {error}</div>;
@@ -345,6 +413,14 @@ export default function App() {
             <p className="subtitle">What is happening, why, and what changed recently.</p>
           </div>
           <div className="app-header-actions">
+            <a
+              href={MONITOR_PORTAL_URL}
+              className="portal-link"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Ops Monitor
+            </a>
             <a
               href={WORKER_PORTAL_URL}
               className="portal-link"
@@ -381,8 +457,10 @@ export default function App() {
             onClick={() => setActiveTab('projects')}
           >
             Projects
-            {projects.length > 0 && (
-              <span className="nav-badge">{projects.length}</span>
+            {projects.filter((p) => (p.status || 'active') === 'active' && !p.archived).length > 0 && (
+              <span className="nav-badge">
+                {projects.filter((p) => (p.status || 'active') === 'active' && !p.archived).length}
+              </span>
             )}
           </button>
           <button
@@ -415,10 +493,27 @@ export default function App() {
           </button>
           <button
             type="button"
-            className={`nav-tab ${activeTab === 'needs' ? 'active' : ''}`}
+            className={`nav-tab ${activeTab === 'revenue' ? 'active' : ''}`}
+            onClick={() => setActiveTab('revenue')}
+          >
+            Revenue
+            {revenue?.openBudgetRequests > 0 && (
+              <span className="nav-tab-badge" aria-label={`${revenue.openBudgetRequests} open budget requests`}>
+                {revenue.openBudgetRequests > 99 ? '99+' : revenue.openBudgetRequests}
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            className={`nav-tab nav-tab--needs ${activeTab === 'needs' ? 'active' : ''}`}
             onClick={() => setActiveTab('needs')}
           >
             Worker requests
+            {pendingNeedsCount > 0 && (
+              <span className="nav-tab-badge" aria-label={`${pendingNeedsCount} pending requests`}>
+                {pendingNeedsCount > 99 ? '99+' : pendingNeedsCount}
+              </span>
+            )}
           </button>
         </nav>
       </header>
@@ -442,24 +537,13 @@ export default function App() {
         )}
 
         {activeTab === 'projects' && (
-          <section className="app-section" aria-labelledby="section-projects">
-            <h2 id="section-projects" className="section-title">Projects</h2>
-            <div className="projects">
-              {projects.length === 0 ? (
-                <p className="empty">
-                  No projects yet. Open <strong>Actions</strong> to create a new request, or add one via API.
-                </p>
-              ) : (
-                projects.map((proj) => (
-                  <ProjectCard
-                    key={proj.id}
-                    project={proj}
-                    recentEvents={eventsByProject[proj.id] || []}
-                  />
-                ))
-              )}
-            </div>
-          </section>
+          <ProjectsPanel
+            projects={projects}
+            eventsByProject={eventsByProject}
+            apiBase={API_BASE}
+            onRefresh={load}
+            onError={onError}
+          />
         )}
 
         {activeTab === 'actions' && (
@@ -502,7 +586,7 @@ export default function App() {
                 {logLoading ? (
                   <p className="empty">Loading…</p>
                 ) : logEvents.length === 0 ? (
-                  <p className="empty">No AI agent activity for this project yet. Select a project to see orchestrator, team_builder, scheduler, project_ai, and org_ai logs.</p>
+                  <p className="empty">No AI agent activity for this project yet. Select a project to see orchestrator, team_builder, scheduler, project_ai, org_ai, and mock_worker NPC logs.</p>
                 ) : (
                   <ul className="log-list">
                     {logEvents.map((e) => (
@@ -520,7 +604,7 @@ export default function App() {
               </div>
             )}
             {!logProjectId && activeTab === 'log' && (
-              <p className="empty">Select a project above to see AI agent logs (orchestrator, team_builder, scheduler, project_ai, org_ai).</p>
+              <p className="empty">Select a project above to see AI agent logs (orchestrator, team_builder, scheduler, project_ai, org_ai, mock_worker).</p>
             )}
           </section>
         )}
@@ -532,17 +616,65 @@ export default function App() {
               data={workforce}
               loading={workforceLoading}
               error={workforceError}
+              apiBase={API_BASE}
+              onHired={() => {
+                fetchJson('/workforce/analytics')
+                  .then(setWorkforce)
+                  .catch(() => {});
+                load();
+              }}
+              onError={onError}
+            />
+          </section>
+        )}
+
+        {activeTab === 'revenue' && (
+          <section className="app-section" aria-labelledby="section-revenue">
+            <h2 id="section-revenue" className="section-title">Revenue &amp; project budgets</h2>
+            <p className="section-desc">
+              Track portfolio spend, burn budget on delivery, request increases when utilization is high, and review
+              the financial matrix across projects and departments.
+            </p>
+            <RevenuePanel
+              data={revenue}
+              loading={revenueLoading}
+              error={revenueError}
+              apiBase={API_BASE}
+              onRefresh={() => {
+                fetchJson('/revenue/analytics')
+                  .then(setRevenue)
+                  .catch(() => {});
+                load();
+                refreshNeeds();
+              }}
+              onError={onError}
             />
           </section>
         )}
 
         {activeTab === 'needs' && (
           <section className="app-section" aria-labelledby="section-needs">
-            <h2 id="section-needs" className="section-title">Worker requests</h2>
-            <p className="section-desc">
-              All worker requests with routing and review status. Project leads and HR manage in the Worker Portal;
-              leadership can approve, reject, or close here (review tasks auto-complete).
-            </p>
+            <div className="needs-section-head">
+              <div>
+                <h2 id="section-needs" className="section-title">Worker requests</h2>
+                <p className="section-desc">
+                  Track worker and project requests. With AI Handler on, routine items (approvals, legal sign-off,
+                  scheduling) are resolved automatically—no manual Approve/Reject queue.
+                  {pendingNeedsCount > 0 && (
+                    <> <strong>{pendingNeedsCount} pending</strong> need your attention when AI Handler is off.</>
+                  )}
+                </p>
+              </div>
+              <label className="ai-handler-toggle">
+                <input
+                  type="checkbox"
+                  checked={aiHandlerAutomatic}
+                  disabled={aiHandlerSaving}
+                  onChange={(e) => setAiHandler(e.target.checked)}
+                />
+                <span>AI Handler (automatic)</span>
+              </label>
+            </div>
             {needsLoading ? (
               <p className="empty">Loading…</p>
             ) : needs.length === 0 ? (
@@ -555,6 +687,9 @@ export default function App() {
                       <span className={`needs-status needs-status--${n.status}`}>{n.status}</span>
                       <strong>{n.title || n.kind}</strong>
                       <span className="needs-kind">{n.kind}</span>
+                      {(n.handlingMode === 'ai' || n.aiAutoApproved || n.aiHandlerResolved) && (
+                        <span className="needs-kind needs-ai-badge">AI handled</span>
+                      )}
                     </div>
                     <span className="log-meta">
                       {n.submitterName && <>From {n.submitterName} · </>}
@@ -576,6 +711,30 @@ export default function App() {
                         {n.reviewNotes ? ` — ${n.reviewNotes}` : ''}
                       </p>
                     )}
+                    {n.effectsError && (
+                      <p className="needs-routing needs-routing--error">
+                        Effects not fully applied: {n.effectsError}
+                      </p>
+                    )}
+                    {n.effectsApplied?.staffing && (
+                      <p className="needs-routing">
+                        Staffing: {n.effectsApplied.staffing.assigned ?? 0} task(s) assigned
+                        {n.effectsApplied.staffing.replanned ? ' · replan triggered' : ''}
+                      </p>
+                    )}
+                    {n.effectsApplied?.teamMember?.targetPersonName && (
+                      <p className="needs-routing">
+                        Applied: {n.effectsApplied.teamMember.targetPersonName}
+                        {n.effectsApplied.teamMember.addedToTeam
+                          ? ' added to project team'
+                          : n.effectsApplied.teamMember.alreadyOnTeam
+                            ? ' already on project team'
+                            : ''}
+                        {n.effectsApplied.teamMember.tasksAssigned?.length > 0
+                          ? ` · ${n.effectsApplied.teamMember.tasksAssigned.length} task(s) assigned`
+                          : ''}
+                      </p>
+                    )}
                     {n.effectsApplied?.taskCount > 0 && (
                       <p className="needs-routing">
                         Applied: unassigned from {n.effectsApplied.taskCount} task(s)
@@ -584,8 +743,49 @@ export default function App() {
                           : ''}
                       </p>
                     )}
-                    {['open', 'in_review'].includes(n.status) && (
+                    {(n.hrHiringQueue || n.hiringRequirements) && (
+                      <p className="needs-routing">
+                        HR hiring queue ({n.hiringStatus || 'pending'}):{' '}
+                        {n.hiredPersonName
+                          ? `Hired ${n.hiredPersonName}`
+                          : n.hiringRequirements || 'See Worker Portal → HR tab'}
+                      </p>
+                    )}
+                    {n.hiringResult?.personName && (
+                      <p className="needs-routing needs-routing--ok">
+                        AI Handler hired {n.hiringResult.personName}
+                        {n.hiringResult.matchScore != null ? ` (match ${n.hiringResult.matchScore})` : ''}
+                      </p>
+                    )}
+                    {!aiHandlerAutomatic &&
+                      n.handlingMode !== 'ai' &&
+                      !n.aiAutoApproved &&
+                      !n.aiHandlerResolved &&
+                      ['open', 'in_review'].includes(n.status) && (
                       <div className="needs-actions">
+                        {n.kind === 'budget_request' && (
+                          <button
+                            type="button"
+                            className="nav-tab"
+                            style={{ marginBottom: 0 }}
+                            onClick={async () => {
+                              try {
+                                await fetchJson(`/revenue/budget-requests/${n.id}/approve`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ reviewerName: 'Leadership' }),
+                                });
+                                await refreshNeeds();
+                                fetchJson('/revenue/analytics').then(setRevenue).catch(() => {});
+                                load();
+                              } catch (e) {
+                                onError(e.message);
+                              }
+                            }}
+                          >
+                            Approve budget
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="nav-tab"
@@ -597,8 +797,7 @@ export default function App() {
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ status: 'in_review', reviewedBy: 'leadership' }),
                               });
-                              const data = await fetchJson('/events/needs');
-                              setNeeds(data.needs || []);
+                              await refreshNeeds();
                             } catch (e) {
                               onError(e.message);
                             }
@@ -617,8 +816,7 @@ export default function App() {
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ status: 'approved', reviewedBy: 'leadership' }),
                               });
-                              const data = await fetchJson('/events/needs');
-                              setNeeds(data.needs || []);
+                              await refreshNeeds();
                               load();
                             } catch (e) {
                               onError(e.message);
@@ -638,8 +836,7 @@ export default function App() {
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ status: 'rejected', reviewedBy: 'leadership' }),
                               });
-                              const data = await fetchJson('/events/needs');
-                              setNeeds(data.needs || []);
+                              await refreshNeeds();
                               load();
                             } catch (e) {
                               onError(e.message);
@@ -659,8 +856,7 @@ export default function App() {
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify({ status: 'met', reviewedBy: 'leadership' }),
                               });
-                              const data = await fetchJson('/events/needs');
-                              setNeeds(data.needs || []);
+                              await refreshNeeds();
                               load();
                             } catch (e) {
                               onError(e.message);
@@ -974,6 +1170,7 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
               Decision
               <select value={decisionType} onChange={(e) => setDecisionType(e.target.value)}>
                 <option value="reprioritize">Reprioritize</option>
+                <option value="complete">Mark project completed</option>
                 <option value="kill_project">Kill project</option>
               </select>
             </label>
@@ -986,119 +1183,6 @@ function SubmitEventForm({ projects, onSuccess, onError }) {
         <button type="submit">Submit</button>
       </form>
     </section>
-  );
-}
-
-function ProjectCard({ project, recentEvents }) {
-  const tasks = project.progress?.tasks || [];
-  const risk = project.risk?.level || 'low';
-  const reasons = project.risk?.reasons || [];
-  const blockers = project.blockers || [];
-  const sortedRecent = [...recentEvents].sort(
-    (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-  );
-
-  return (
-    <article className="project-card">
-      <h2>{project.title || project.id}</h2>
-      <div className="meta">
-        <span className="meta-line">
-          Project: <strong>{project.id}</strong>
-        </span>
-        <span className="meta-line">
-          Status: <strong>{project.status}</strong>
-        </span>
-        {(project.department || project.team || project.sponsor) && (
-          <span className="meta-line">
-            Org: {project.department && <>{project.department}</>}
-            {project.team && <> · {project.team}</>}
-            {project.sponsor && <> · Sponsor: {project.sponsor}</>}
-          </span>
-        )}
-        {project.lastUpdatedAt && (
-          <span className="meta-line">
-            Last updated {new Date(project.lastUpdatedAt).toLocaleString()}
-          </span>
-        )}
-      </div>
-
-      {risk !== 'low' && (
-        <div className={`risk ${risk}`}>
-          Risk: {risk}
-          {reasons.length > 0 && ` — ${reasons[reasons.length - 1]}`}
-        </div>
-      )}
-
-      {tasks.length > 0 && (
-        <ul className="tasks">
-          {tasks.map((t) => (
-            <li key={t.id}>
-              <div>
-                <span className="task-title">{t.title || t.id}</span>
-                {t.status && <span className="task-status"> [{t.status}]</span>}
-              </div>
-              {t.assigneeNote && (
-                <div className="task-assignee task-assignee--leave">
-                  {t.assigneeNote}
-                </div>
-              )}
-              {t.assignee && !t.assigneeNote && (
-                <div className="task-assignee">
-                  Assignee: <strong>{t.assignee.name || t.assignee.id}</strong>
-                  {t.assignee.team && ` — ${t.assignee.team}`}
-                  {t.assignee.department && ` (${t.assignee.department})`}
-                  {t.assignee.role && ` · ${t.assignee.role}`}
-                </div>
-              )}
-              {!t.assignee && !t.assigneeNote && t.assigneeId && (
-                <div className="task-assignee task-assignee--muted">Unassigned</div>
-              )}
-              {t.scheduledStart && (
-                <div className="task-schedule">
-                  Schedule:{' '}
-                  {new Date(t.scheduledStart).toLocaleDateString()}–
-                  {new Date(t.scheduledEnd || t.scheduledStart).toLocaleDateString()}
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {blockers.length > 0 && (
-        <div className="blockers">
-          <strong>Blockers:</strong>
-          <ul>
-            {blockers.map((b, i) => (
-              <li key={i}>{b.description || b.taskId} ({b.taskId})</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {sortedRecent.length > 0 && (
-        <section className="recent-events" aria-label="What changed recently">
-          <h3 className="recent-events-title">What changed recently</h3>
-          <ol className="log-list recent-events-list">
-            {sortedRecent.map((e) => {
-              const summary = recentEventSummary(e, project);
-              return (
-                <li key={e.id} className="log-entry recent-events-item">
-                  <time className="recent-events-time" dateTime={e.timestamp}>
-                    {new Date(e.timestamp).toLocaleString()}
-                  </time>
-                  <span className="log-meta">
-                    <strong>{e.type}</strong>
-                    <span className="recent-events-source">({e.source})</span>
-                  </span>
-                  {summary && <p className="log-message recent-events-summary">{summary}</p>}
-                </li>
-              );
-            })}
-          </ol>
-        </section>
-      )}
-    </article>
   );
 }
 
@@ -1197,11 +1281,25 @@ function OrgInsightsPanel({ orgInsights }) {
         <div className="org-section">
           <h3>People</h3>
           <ul className="org-list">
-            {peopleInsights.map((pi) => (
+            {peopleInsights.map((pi) => {
+              const onLeave =
+                pi.loadLevel === 'on_leave' || pi.availabilityStatus === 'on_leave';
+              const loadLabel =
+                pi.loadLevel === 'on_leave'
+                  ? 'on leave'
+                  : pi.loadLevel === 'emergency_return'
+                    ? 'emergency return'
+                    : pi.loadLevel;
+              return (
               <li key={pi.personId || pi.name} className="org-item">
                 <div className="org-item-header">
                   <strong>{pi.name || pi.personId}</strong>
-                  {pi.loadLevel && <span className="org-tag">{pi.loadLevel}</span>}
+                  {loadLabel && (
+                    <span className={`org-tag${onLeave ? ' org-tag--leave' : ''}`}>{loadLabel}</span>
+                  )}
+                  {pi.availabilityReason && onLeave && (
+                    <span className="org-tag org-tag--leave-reason">{pi.availabilityReason}</span>
+                  )}
                 </div>
                 {pi.summary && <p className="org-summary">{pi.summary}</p>}
                 {Array.isArray(pi.suggestedRequests) && pi.suggestedRequests.length > 0 && (
@@ -1215,7 +1313,8 @@ function OrgInsightsPanel({ orgInsights }) {
                   </ul>
                 )}
               </li>
-            ))}
+            );
+            })}
           </ul>
         </div>
       )}

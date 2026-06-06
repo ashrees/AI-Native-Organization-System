@@ -1,0 +1,11 @@
+{
+  "name": "ai-native-org-docs",
+  "private": true,
+  "description": "PDF generation for platform assessments",
+  "scripts": {
+    "pdf:assessment": "node generate-assessment-pdfkit.mjs"
+  },
+  "dependencies": {
+    "pdfkit": "^0.17.2"
+  }
+}

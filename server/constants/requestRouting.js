@@ -2,6 +2,8 @@
  * Every worker request kind forwards to explicit organizational roles and/or AI agents.
  */
 
+const { getPersonalHr } = require('../services/personalHr');
+
 const ORG_GENERAL_PROJECT_ID = 'org-general';
 
 /** Role ids used for matching people in the directory. */
@@ -36,6 +38,7 @@ const ROLES = Object.freeze({
     match: (p) => {
       const d = (p.department || '').toLowerCase();
       const r = (p.role || '').toLowerCase();
+      if (d.includes('data')) return false;
       return d.includes('engineering') && (r.includes('manager') || r.includes('lead'));
     },
   },
@@ -106,6 +109,14 @@ const KIND_ROUTES = Object.freeze({
     aiAgent: 'orchestrator',
     label: 'Project lead + Engineering mgmt',
   },
+  capacity: {
+    roles: ['project_lead', 'project_team', 'engineering_mgmt'],
+    projectScoped: true,
+    orgFallbackRoles: ['hr'],
+    hrInbox: false,
+    aiAgent: 'orchestrator',
+    label: 'Project lead + Team + Engineering mgmt',
+  },
   project_contribution_change: {
     roles: ['project_lead', 'project_team'],
     projectScoped: true,
@@ -148,6 +159,34 @@ const KIND_ROUTES = Object.freeze({
     hrInbox: true,
     aiAgent: 'scheduler',
     label: 'DevOps + HR',
+  },
+  team_member: {
+    roles: ['project_lead', 'project_team', 'hr'],
+    projectScoped: true,
+    hrInbox: true,
+    aiAgent: 'orchestrator',
+    label: 'Project lead + Project team + HR',
+  },
+  onboarding: {
+    roles: ['hr', 'project_lead', 'project_team'],
+    projectScoped: true,
+    hrInbox: true,
+    aiAgent: 'orchestrator',
+    label: 'HR + Project lead + Project team',
+  },
+  hiring_request: {
+    roles: ['hr'],
+    projectScoped: true,
+    hrInbox: true,
+    aiAgent: 'org_ai',
+    label: 'HR — Hiring',
+  },
+  budget_request: {
+    roles: ['finance', 'project_lead', 'engineering_mgmt'],
+    projectScoped: true,
+    hrInbox: false,
+    aiAgent: 'org_ai',
+    label: 'Finance + Project lead',
   },
   general: {
     roles: ['hr'],
@@ -212,8 +251,9 @@ function getRoutingForKind(kind, projectId) {
 function peopleForRole(roleId, people, excludeId) {
   const def = ROLES[roleId];
   if (!def || roleId === 'project_lead' || roleId === 'project_team') return [];
+  const { personCanWork } = require('../services/emergencyReturn');
   return (people || [])
-    .filter((p) => p.id !== excludeId && def.match(p))
+    .filter((p) => p.id !== excludeId && def.match(p) && personCanWork(p))
     .sort((a, b) => (a.currentLoad ?? 0) - (b.currentLoad ?? 0));
 }
 
@@ -282,6 +322,19 @@ function resolveForwardTargets(kind, projectId, projects, people, submitterId) {
       const rep = pickProjectTeamRepresentative(projectId, submitterId, projects, people);
       if (rep) add(rep);
       continue;
+    }
+    if (roleId === 'hr') {
+      const personal = submitterId ? getPersonalHr(submitterId, people) : null;
+      if (personal) {
+        add({
+          personId: personal.id,
+          name: personal.name,
+          role: roleId,
+          agent: ROLES[roleId].agent,
+          personalHr: true,
+        });
+        continue;
+      }
     }
     const matches = peopleForRole(roleId, people, submitterId);
     if (matches[0]) {

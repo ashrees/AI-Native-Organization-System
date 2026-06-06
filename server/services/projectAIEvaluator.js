@@ -40,7 +40,9 @@ function formatTrigger(triggerEvent) {
   };
 }
 
-function stubAssessment(metrics, trigger) {
+function stubAssessment(metrics, trigger, projectState, projectEvents) {
+  const { scanDeliverableGaps, gapsToSummary, gapsToAgentActions } = require('./projectAIDeliverables');
+  const deliverableGaps = scanDeliverableGaps(projectState, projectEvents);
   const tasks = metrics.tasks || {};
   const total = tasks.total || 0;
   const done = tasks.done || 0;
@@ -74,29 +76,45 @@ function stubAssessment(metrics, trigger) {
     summaryParts.push(`Project has ${done}/${total} tasks done, ${blocked} blocked.`);
   }
 
+  let suggestProjectCompleted =
+    total > 0 && done === total && blocked === 0 && blockerCount === 0;
+  let gapActions = [];
+
+  if (deliverableGaps.length > 0) {
+    suggestProjectCompleted = false;
+    if (riskLevel === 'low') riskLevel = 'medium';
+    const gapSummary = gapsToSummary(deliverableGaps);
+    if (gapSummary) summaryParts.push(gapSummary);
+    gapActions = gapsToAgentActions(deliverableGaps, projectState, projectEvents);
+  }
+
   return {
     summary: summaryParts.join(' '),
     riskLevel,
     riskReason:
-      blockerCount > 0 || blocked > 0
-        ? `${blocked} blocked task(s), ${blockerCount} blocker(s) recorded`
-        : done === total && total > 0
-          ? 'All tasks complete'
-          : `${done} of ${total} tasks done`,
+      deliverableGaps.length > 0
+        ? gapsToSummary(deliverableGaps)
+        : blockerCount > 0 || blocked > 0
+          ? `${blocked} blocked task(s), ${blockerCount} blocker(s) recorded`
+          : done === total && total > 0
+            ? 'All tasks complete'
+            : `${done} of ${total} tasks done`,
     recentChanges: [
       taskId && status
         ? `Update: ${taskId} → ${status}`
         : trigger?.poll
           ? 'Periodic project status review'
           : 'Project status reviewed',
+      ...deliverableGaps.slice(0, 2).map((g) => `Gap: ${g.type}${g.evidence ? ` — ${g.evidence}` : ''}`),
     ],
-    suggestProjectCompleted: total > 0 && done === total && blocked === 0 && blockerCount === 0,
-    agentActions: [],
+    suggestProjectCompleted,
+    deliverableGaps,
+    agentActions: gapActions,
   };
 }
 
-function normalizeAssessment(raw, metrics, trigger, projectState, store) {
-  const stub = stubAssessment(metrics, trigger);
+function normalizeAssessment(raw, metrics, trigger, projectState, store, projectEvents) {
+  const stub = stubAssessment(metrics, trigger, projectState, projectEvents);
   if (!raw || typeof raw !== 'object') {
     return {
       ...stub,
@@ -106,21 +124,58 @@ function normalizeAssessment(raw, metrics, trigger, projectState, store) {
   let riskLevel = raw.riskLevel || metrics.risk?.level || 'medium';
   if (!RISK_LEVELS.includes(riskLevel)) riskLevel = 'medium';
 
+  let suggestProjectCompleted = !!raw.suggestProjectCompleted;
+  if ((stub.deliverableGaps || []).length > 0) {
+    suggestProjectCompleted = false;
+  }
+
+  const baseActions = normalizeAgentActions(raw.agentActions, metrics, projectState, store);
+  const { gapsToAgentActions } = require('./projectAIDeliverables');
+  const gapActions = gapsToAgentActions(stub.deliverableGaps || [], projectState, projectEvents);
+  let mergedActions = [...gapActions, ...baseActions].slice(0, 6);
+
+  const noGaps = !(stub.deliverableGaps || []).length;
+  const llmMentionsBudgetGap = (text) =>
+    /\b(budget|deliverable)\b.*\b(gap|missing|unresolved|loop|not\s+confirmed)\b/i.test(text || '');
+
+  let summary = typeof raw.summary === 'string' ? raw.summary.trim() : stub.summary;
+  let riskReason = typeof raw.riskReason === 'string' ? raw.riskReason.trim() : stub.riskReason;
+
+  if (noGaps) {
+    if (llmMentionsBudgetGap(summary) || llmMentionsBudgetGap(riskReason)) {
+      summary = stub.summary;
+      riskReason = stub.riskReason;
+    }
+    if (stub.suggestProjectCompleted) {
+      suggestProjectCompleted = true;
+      riskLevel = stub.riskLevel;
+    } else if (noGaps && stub.riskLevel === 'low' && riskLevel === 'high') {
+      riskLevel = 'low';
+    }
+    mergedActions = mergedActions.filter(
+      (a) =>
+        !(
+          a.action === 'create_need' &&
+          (a.payload?.kind === 'budget_request' ||
+            String(a.payload?.kind || '').includes('budget'))
+        )
+    );
+  }
+
   return {
-    summary: typeof raw.summary === 'string' ? raw.summary.trim() : stub.summary,
-    riskLevel,
-    riskReason: typeof raw.riskReason === 'string' ? raw.riskReason.trim() : stub.riskReason,
+    summary,
+    riskLevel: (stub.deliverableGaps || []).length > 0 && riskLevel === 'low' ? 'medium' : riskLevel,
+    riskReason,
     recentChanges: Array.isArray(raw.recentChanges) ? raw.recentChanges.map(String).slice(0, 5) : stub.recentChanges,
-    suggestProjectCompleted: !!raw.suggestProjectCompleted,
-    agentActions: normalizeAgentActions(raw.agentActions, metrics, projectState, store),
+    suggestProjectCompleted,
+    deliverableGaps: stub.deliverableGaps || [],
+    agentActions: mergedActions,
   };
 }
 
 function shouldScheduleStatusCheck(event) {
   if (!event || !event.projectId) return false;
   if (event.source === 'project_ai') return false;
-  if (event.type === 'decision' && event.payload?.decisionType === 'project_assessment') return false;
-  if (event.type === 'decision' && event.payload?.decisionType === 'assignment_gap_fill') return false;
 
   const watchTypes = new Set([
     'execution',
@@ -129,15 +184,25 @@ function shouldScheduleStatusCheck(event) {
     'schedule_proposed',
     'need',
     'unassignment',
+    'request',
     'poll',
   ]);
   if (watchTypes.has(event.type)) return true;
 
   if (event.type === 'decision') {
-    const dt = event.payload?.decisionType;
-    if (dt === 'reprioritize' || dt === 'reprioritization' || dt === 'complete' || dt === 'completed') {
-      return true;
+    const dt = event.payload?.decisionType || '';
+    if (dt === 'project_assessment' && event.source === 'project_ai') return false;
+    if (dt === 'assignment_gap_fill') return false;
+    const rationale = event.rationale || event.payload?.summary || '';
+    if (
+      event.source === 'human' &&
+      /\bworker request\b/i.test(rationale) &&
+      /\bapproved\b/i.test(rationale) &&
+      /\bbudget\b/i.test(rationale)
+    ) {
+      return false;
     }
+    return true;
   }
 
   return false;
@@ -150,7 +215,18 @@ async function runProjectAIEvaluation(projectId, triggerEvent, ctx) {
   const { emitEvent, getStore, loadPeople } = ctx;
   const store = getStore();
   const projectState = store.projects[projectId];
-  if (!projectState || projectState.status === 'killed') return null;
+  if (!projectState || projectState.status === 'killed' || projectState.archived) {
+    return null;
+  }
+
+  const pendingTasks = (projectState.progress?.tasks || []).filter((t) => t.status !== 'done');
+  if (projectState.status === 'completed' && pendingTasks.length === 0) {
+    return null;
+  }
+  if (projectState.status === 'completed' && pendingTasks.length > 0) {
+    projectState.status = 'active';
+    projectState.closedAt = null;
+  }
 
   const projectEvents = (store.eventLog || []).filter((e) => e.projectId === projectId);
   const metrics = buildProjectMetrics(projectState, projectEvents);
@@ -164,21 +240,57 @@ async function runProjectAIEvaluation(projectId, triggerEvent, ctx) {
     metrics: { projects: [metrics] },
   });
 
-  const input = { trigger, agentContext, metrics };
+  const tasksDetail = (projectState.progress?.tasks || []).map((t) => ({
+    id: t.id,
+    title: t.title,
+    status: t.status || 'pending',
+    assigneeId: t.assigneeId || t.assignee?.id || null,
+    scheduledStart: t.scheduledStart || null,
+    scheduledEnd: t.scheduledEnd || null,
+    hasSchedule: Boolean(t.scheduledStart && t.scheduledEnd),
+  }));
+
+  const { scanDeliverableGaps } = require('./projectAIDeliverables');
+  const deliverableGaps = scanDeliverableGaps(projectState, projectEvents);
+  const recentSignals = projectEvents.slice(-12).map((e) => ({
+    type: e.type,
+    source: e.source,
+    timestamp: e.timestamp,
+    rationale: (e.rationale || '').slice(0, 160),
+    decisionType: e.payload?.decisionType,
+    taskId: e.payload?.taskId,
+    status: e.payload?.status,
+    notes: e.payload?.notes ? String(e.payload.notes).slice(0, 160) : undefined,
+  }));
+
+  const input = {
+    trigger,
+    agentContext,
+    metrics,
+    tasks: tasksDetail,
+    deliverableGaps,
+    recentSignals,
+  };
   const systemPrompt = readPrompt('projectAI');
-  let assessment = normalizeAssessment(null, metrics, trigger, projectState, store);
+  let assessment = normalizeAssessment(null, metrics, trigger, projectState, store, projectEvents);
 
   if (systemPrompt) {
     const result = await complete(systemPrompt, JSON.stringify(input), {
       agent: 'project_ai',
       projectId,
+      projectTitle: projectState.title || projectId,
       context: 'project_assessment',
       timeoutMs: 120000,
       tools: OLLAMA_TOOLS.projectAI,
     });
-    assessment = normalizeAssessment(result, metrics, trigger, projectState, store);
+    assessment = normalizeAssessment(result, metrics, trigger, projectState, store, projectEvents);
   } else {
-    assessment.agentActions = normalizeAgentActions([], metrics, projectState, store);
+    assessment.agentActions = normalizeAgentActions(
+      assessment.agentActions || [],
+      metrics,
+      projectState,
+      store
+    );
   }
 
   const actionSummary =
@@ -213,6 +325,8 @@ async function runProjectAIEvaluation(projectId, triggerEvent, ctx) {
       triggerTaskId: trigger.taskId,
       triggerStatus: trigger.status,
       agentActions: assessment.agentActions,
+      deliverableGapCount: (assessment.deliverableGaps || []).length,
+      deliverableGaps: (assessment.deliverableGaps || []).slice(0, 12),
     },
   };
 
@@ -258,11 +372,20 @@ function scheduleProjectAIReevaluation(projectId, triggerEvent, ctx) {
 
 function startProjectAIStatusPolling(ctx) {
   if (POLL_INTERVAL_MS <= 0 || pollTimer) return;
-  pollTimer = setInterval(() => {
+  const activeIds = () => {
     const store = ctx.getStore?.();
-    if (!store?.projects) return;
-    for (const [projectId, state] of Object.entries(store.projects)) {
-      if (state.status !== 'active') continue;
+    if (!store?.projects) return [];
+    return Object.entries(store.projects)
+      .filter(([, state]) => state.status === 'active')
+      .map(([id]) => id);
+  };
+  let pollCursor = 0;
+  pollTimer = setInterval(() => {
+    const ids = activeIds();
+    if (ids.length === 0) return;
+    const batch = Math.min(3, ids.length);
+    for (let i = 0; i < batch; i++) {
+      const projectId = ids[(pollCursor + i) % ids.length];
       scheduleProjectStatusCheck(
         projectId,
         {
@@ -276,16 +399,36 @@ function startProjectAIStatusPolling(ctx) {
         ctx
       );
     }
+    pollCursor = (pollCursor + batch) % Math.max(1, ids.length);
   }, POLL_INTERVAL_MS);
   if (typeof pollTimer.unref === 'function') pollTimer.unref();
-  console.log(`[Project AI] Status polling every ${Math.round(POLL_INTERVAL_MS / 1000)}s`);
+  console.log(`[Project AI] Status polling every ${Math.round(POLL_INTERVAL_MS / 1000)}s (staggered)`);
+}
+
+function stopProjectAIPolling() {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+  for (const t of pendingChecks.values()) clearTimeout(t);
+  pendingChecks.clear();
+}
+
+function getProjectAIRuntimeStatus() {
+  return {
+    pendingChecks: pendingChecks.size,
+    pollIntervalMs: POLL_INTERVAL_MS,
+    debounceMs: DEBOUNCE_MS,
+  };
 }
 
 module.exports = {
+  stopProjectAIPolling,
   runProjectAIEvaluation,
   scheduleProjectStatusCheck,
   scheduleProjectAIReevaluation,
   startProjectAIStatusPolling,
   shouldScheduleStatusCheck,
+  getProjectAIRuntimeStatus,
   stubAssessment,
 };

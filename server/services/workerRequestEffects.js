@@ -4,13 +4,14 @@
 
 const crypto = require('crypto');
 const agentActivityLog = require('../lib/agentActivityLog');
+const { resolveForwardTargets } = require('../constants/requestRouting');
 const { ORG_GENERAL_PROJECT_ID } = require('../constants/workerRequests');
+const { personCanWork } = require('./emergencyReturn');
 
 const LEAVE_KINDS = new Set(['sick_leave', 'vacation']);
 const PROJECT_REMOVAL_KINDS = new Set([
   'project_contribution_change',
   'project_transfer',
-  'role_change',
 ]);
 
 function taskAssigneeId(task) {
@@ -54,6 +55,115 @@ async function emitLeaveNoticeOnProject(ctx, { projectId, personId, personName, 
     projectId,
     message: reason,
   });
+}
+
+/**
+ * When a reviewer goes on leave, release their wr-* review tasks and reassign open needs if possible.
+ */
+async function releaseReviewTasksAssignedToReviewer(personId, correlationId, ctx) {
+  const { getStore, emitEvent, loadPeople } = ctx;
+  const people = loadPeople();
+  const eventLog = getStore().eventLog || [];
+  const projects = getStore().projects || {};
+  for (const [projectId, state] of Object.entries(projects)) {
+    for (const task of state?.progress?.tasks || []) {
+      if (taskAssigneeId(task) !== personId) continue;
+      if (!String(task.id || '').startsWith('wr-')) continue;
+
+      const assignmentEv = [...eventLog]
+        .reverse()
+        .find(
+          (e) =>
+            e.type === 'assignment' &&
+            e.projectId === projectId &&
+            e.payload?.taskId === task.id &&
+            e.payload?.personId === personId
+        );
+      const needId = assignmentEv?.correlationId;
+      const needEvent = needId
+        ? eventLog.find((e) => e.id === needId && e.type === 'need')
+        : null;
+      const needOpen =
+        needEvent && ['open', 'in_review'].includes(needEvent.payload?.status || 'open');
+
+      await emitUnassignment(ctx, {
+        projectId,
+        taskId: task.id,
+        personId,
+        correlationId: correlationId || needId,
+        reason: 'Reviewer on leave — review task released',
+      });
+
+      if (task.status !== 'done') {
+        await emitEvent({
+          id: crypto.randomUUID(),
+          type: 'execution',
+          timestamp: new Date().toISOString(),
+          projectId,
+          source: 'system',
+          correlationId: needId || correlationId,
+          rationale: `Reviewer ${personId} on leave — review task closed`,
+          payload: {
+            taskId: task.id,
+            status: 'done',
+            notes: 'Closed: assigned reviewer on leave',
+          },
+        });
+      }
+
+      if (!needOpen || !needEvent) continue;
+
+      const kind = needEvent.payload?.kind;
+      const submitterId = needEvent.payload?.personId;
+      const targets = resolveForwardTargets(
+        kind,
+        projectId,
+        projects,
+        people,
+        submitterId
+      ).filter((t) => t.personId && t.personId !== personId);
+
+      for (const target of targets) {
+        const assignee = people.find((p) => p.id === target.personId);
+        if (!assignee || !personCanWork(assignee)) continue;
+        const already = (needEvent.payload?.roleAssignments || []).some(
+          (a) => a.role === target.role && a.assigneeId === assignee.id
+        );
+        if (already) continue;
+
+        const reviewTitle = `Review worker request: ${needEvent.payload?.title || kind}`;
+        const reviewDesc = needEvent.payload?.description || reviewTitle;
+        const submitter = people.find((p) => p.id === submitterId);
+        const { createReviewTask } = require('./workerRequestHandler');
+        const result = await createReviewTask(
+          needEvent,
+          ctx,
+          assignee,
+          `[${target.roleLabel}] ${reviewTitle}`,
+          reviewDesc,
+          submitter?.name || submitterId,
+          target.roleLabel,
+          target.role
+        );
+        needEvent.payload.roleAssignments = [
+          ...(needEvent.payload?.roleAssignments || []).filter(
+            (a) => a.role !== target.role
+          ),
+          {
+            ...result,
+            role: target.role,
+            agent: target.agent,
+            assigneeName: assignee.name,
+          },
+        ];
+        agentActivityLog.push({
+          source: 'org_ai',
+          projectId,
+          message: `Reassigned ${target.roleLabel} review to ${assignee.name} after previous reviewer went on leave.`,
+        });
+      }
+    }
+  }
 }
 
 /** Complete open "Review worker request" tasks tied to this person's needs. */
@@ -158,29 +268,195 @@ async function releasePersonFromAllProjects(personId, correlationId, ctx, reason
 
 const { setPersonAvailability } = require('../lib/personAvailability');
 
+function inferRequestedRole(title, description) {
+  const text = `${title || ''}\n${description || ''}`;
+  const patterns = [
+    /(?:change|changing)\s+(?:my\s+)?role\s+to\s+(.+)/i,
+    /(?:role|position|title)\s+(?:to|as|:)\s+([^.\n]+)/i,
+    /(?:promote|promotion)\s+(?:to|as)\s+(.+)/i,
+    /(?:become|becoming)\s+(?:a|an)?\s*(.+)/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m?.[1]) return m[1].trim().slice(0, 120);
+  }
+  return null;
+}
+
+async function applyRoleChangeEffects(needEvent, reviewer, ctx) {
+  const personId = needEvent.payload?.personId;
+  const title = needEvent.payload?.title || 'role_change';
+  const projectId = needEvent.projectId;
+  const { loadPeople, refreshPeopleCache, emitEvent, getStore } = ctx;
+  const postgresStore = require('../store/postgresStore');
+  const { matchEssentialRoleByTitle, isLeadershipJobTitle } = require('../lib/projectMemberRoles');
+  const { ORG_GENERAL_PROJECT_ID } = require('../constants/workerRequests');
+
+  const person = loadPeople().find((p) => p.id === personId);
+  if (!person) return { personId, updated: false };
+
+  const requestedRole =
+    needEvent.payload?.requestedRole ||
+    inferRequestedRole(title, needEvent.payload?.description);
+  const previousRole = person.role;
+  const essential = matchEssentialRoleByTitle(requestedRole);
+  const onProject = projectId && projectId !== ORG_GENERAL_PROJECT_ID;
+
+  if (essential) {
+    if (!onProject) {
+      const msg = `${person.name}: "${essential.label}" is a project role assigned by the orchestrator, not a global job title.`;
+      needEvent.payload.effectsError = msg;
+      return { personId, skipped: 'essential_role_project_scoped', error: msg };
+    }
+
+    const state = getStore().projects[projectId];
+    if (!state || state.status !== 'active') {
+      return { personId, skipped: 'project_not_active' };
+    }
+
+    const roleEntry = {
+      roleId: essential.id,
+      label: essential.label,
+      personId: person.id,
+      name: person.name,
+      department: person.department,
+      team: person.team,
+      jobTitle: isLeadershipJobTitle(person.role) ? 'Individual Contributor' : person.role,
+    };
+
+    await emitEvent({
+      id: crypto.randomUUID(),
+      type: 'decision',
+      timestamp: new Date().toISOString(),
+      projectId,
+      source: 'system',
+      correlationId: needEvent.id,
+      rationale: `${person.name} assigned as ${essential.label} on this project only (not org-wide).`,
+      payload: {
+        decisionType: 'project_roles_assigned',
+        roles: { [essential.id]: roleEntry },
+        fromWorkerRequest: true,
+        needId: needEvent.id,
+      },
+    });
+
+    const summary = `${person.name} is ${essential.label} on ${projectId} (project-local; directory job title unchanged).`;
+    agentActivityLog.push({ source: 'orchestrator', projectId, message: summary });
+
+    return {
+      personId,
+      personName: person.name,
+      projectRoleId: essential.id,
+      projectRoleLabel: essential.label,
+      projectScoped: true,
+      updated: true,
+    };
+  }
+
+  let updatedPerson = person;
+  if (requestedRole && requestedRole !== previousRole && !isLeadershipJobTitle(requestedRole)) {
+    updatedPerson = { ...person, role: requestedRole };
+    await postgresStore.upsertPerson(updatedPerson);
+    if (typeof refreshPeopleCache === 'function') await refreshPeopleCache();
+  } else if (requestedRole && isLeadershipJobTitle(requestedRole)) {
+    const msg = `"${requestedRole}" is a project leadership role; use orchestrator setup or a project-scoped request.`;
+    needEvent.payload.effectsError = msg;
+    return { personId, skipped: 'leadership_not_global', error: msg };
+  }
+
+  const summary = requestedRole
+    ? `${person.name}'s job title updated to "${requestedRole}" (was "${previousRole || 'unset'}").`
+    : `${person.name}'s role change approved.`;
+
+  await emitEvent({
+    id: crypto.randomUUID(),
+    type: 'decision',
+    timestamp: new Date().toISOString(),
+    projectId: needEvent.projectId,
+    source: 'system',
+    correlationId: needEvent.id,
+    rationale: summary,
+    payload: {
+      decisionType: 'role_change_approved',
+      personId,
+      personName: person.name,
+      previousRole,
+      newRole: requestedRole || previousRole,
+      title,
+      scope: 'directory_job_title',
+    },
+  });
+
+  agentActivityLog.push({
+    source: 'org_ai',
+    projectId: needEvent.projectId,
+    message: summary,
+  });
+
+  return {
+    personId,
+    personName: person.name,
+    previousRole,
+    newRole: requestedRole || previousRole,
+    updated: !!requestedRole && requestedRole !== previousRole,
+  };
+}
+
 /**
  * Apply org-wide updates after HR/leadership approves a worker request.
  */
 async function applyApprovedRequestEffects(needEvent, reviewer, ctx) {
+  const {
+    isTeamMemberRequest,
+    applyTeamMemberEffects,
+    teamMemberEffectsComplete,
+    requiresResolvedTarget,
+  } = require('./workerRequestTeamMember');
+
   const kind = needEvent.payload?.kind;
   const personId = needEvent.payload?.personId;
   const projectId = needEvent.projectId;
   const title = needEvent.payload?.title || kind;
   const { loadPeople } = ctx;
-  const person = loadPeople().find((p) => p.id === personId);
+  const person = personId ? loadPeople().find((p) => p.id === personId) : null;
   const effects = {
     kind,
-    personId,
+    personId: personId || null,
     personName: person?.name,
     availability: null,
     tasksReleased: [],
     projectsCleared: [],
   };
 
-  if (!personId) return effects;
-
   const correlationId = needEvent.id;
   const reviewerName = reviewer?.name || 'Reviewer';
+
+  if (isTeamMemberRequest(needEvent) && !teamMemberEffectsComplete(needEvent)) {
+    const teamMember = await applyTeamMemberEffects(needEvent, reviewer, ctx);
+    if (teamMember) effects.teamMember = teamMember;
+    if (requiresResolvedTarget(needEvent) && teamMember?.skipped === 'target_person_not_found') {
+      needEvent.payload.effectsError = teamMember.error;
+    }
+  }
+
+  if (!personId) {
+    needEvent.payload.effectsApplied = {
+      at: new Date().toISOString(),
+      ...effects,
+      taskCount: effects.tasksReleased.length,
+    };
+    if (!effects.teamMember) {
+      const { applyStaffingAndCapacityEffects } = require('./workerRequestStaffing');
+      const staffing = await applyStaffingAndCapacityEffects(needEvent, reviewer, ctx);
+      if (staffing) effects.staffing = staffing;
+      needEvent.payload.effectsApplied = {
+        ...needEvent.payload.effectsApplied,
+        staffing: effects.staffing,
+      };
+    }
+    if (typeof ctx.recomputePeopleLoad === 'function') await ctx.recomputePeopleLoad();
+    return effects;
+  }
 
   if (LEAVE_KINDS.has(kind)) {
     effects.availability = await setPersonAvailability(
@@ -221,6 +497,7 @@ async function applyApprovedRequestEffects(needEvent, reviewer, ctx) {
     }
 
     await cancelReviewTasksForSubmitter(personId, correlationId, ctx);
+    await releaseReviewTasksAssignedToReviewer(personId, correlationId, ctx);
 
     agentActivityLog.push({
       source: 'org_ai',
@@ -252,6 +529,10 @@ async function applyApprovedRequestEffects(needEvent, reviewer, ctx) {
     }
   }
 
+  if (kind === 'role_change') {
+    effects.roleChange = await applyRoleChangeEffects(needEvent, reviewer, ctx);
+  }
+
   if (PROJECT_REMOVAL_KINDS.has(kind)) {
     const targetProject =
       projectId && projectId !== ORG_GENERAL_PROJECT_ID ? projectId : null;
@@ -266,7 +547,7 @@ async function applyApprovedRequestEffects(needEvent, reviewer, ctx) {
       );
       effects.tasksReleased.push(...batch);
       effects.projectsCleared.push(targetProject);
-    } else if (kind === 'project_transfer' || kind === 'role_change') {
+    } else if (kind === 'project_transfer') {
       effects.tasksReleased = await releasePersonFromAllProjects(
         personId,
         correlationId,
@@ -284,6 +565,10 @@ async function applyApprovedRequestEffects(needEvent, reviewer, ctx) {
       });
     }
   }
+
+  const { applyStaffingAndCapacityEffects } = require('./workerRequestStaffing');
+  const staffing = await applyStaffingAndCapacityEffects(needEvent, reviewer, ctx);
+  if (staffing) effects.staffing = staffing;
 
   if (typeof ctx.recomputePeopleLoad === 'function') {
     await ctx.recomputePeopleLoad();
@@ -331,12 +616,14 @@ async function recordLeaveProjectNotices(needEvent, ctx) {
 
 module.exports = {
   applyApprovedRequestEffects,
+  applyRoleChangeEffects,
   recordLeaveProjectNotices,
   releasePersonFromProject,
   releasePersonFromAllProjects,
   setPersonAvailability,
   clearPersonAvailability: require('../lib/personAvailability').clearPersonAvailability,
   findProjectsWithPerson,
+  inferRequestedRole,
   LEAVE_KINDS,
   PROJECT_REMOVAL_KINDS,
 };

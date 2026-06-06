@@ -7,6 +7,11 @@ const {
   recordLeaveProjectNotices,
   LEAVE_KINDS,
 } = require('../services/workerRequestEffects');
+const {
+  isTeamMemberRequest,
+  applyTeamMemberEffects,
+  teamMemberEffectsComplete,
+} = require('../services/workerRequestTeamMember');
 
 async function reconcileApprovedWorkerRequests(eventsRouter) {
   const eventLog = eventsRouter.getEventLog();
@@ -14,7 +19,7 @@ async function reconcileApprovedWorkerRequests(eventsRouter) {
   let count = 0;
 
   for (const e of eventLog) {
-    if (e.type !== 'need' || e.source !== 'human') continue;
+    if (e.type !== 'need') continue;
     if (e.payload?.status !== 'approved') continue;
     const reviewer = {
       id: e.payload.reviewedBy || 'system',
@@ -25,6 +30,20 @@ async function reconcileApprovedWorkerRequests(eventsRouter) {
       await recordLeaveProjectNotices(e, ctx);
       await eventsRouter.updateWorkerRequest(e.id, e.payload);
       count += 1;
+      continue;
+    }
+
+    if (isTeamMemberRequest(e) && !teamMemberEffectsComplete(e)) {
+      const teamMember = await applyTeamMemberEffects(e, reviewer, ctx);
+      if (teamMember) {
+        e.payload.effectsApplied = {
+          ...(e.payload.effectsApplied || {}),
+          at: e.payload.effectsApplied?.at || new Date().toISOString(),
+          teamMember,
+        };
+        await eventsRouter.updateWorkerRequest(e.id, e.payload);
+        count += 1;
+      }
       continue;
     }
 

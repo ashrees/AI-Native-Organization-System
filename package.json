@@ -8,7 +8,8 @@
     "start": "node server/index.js",
     "dev": "node server/index.js",
     "dev:client": "npm run dev --prefix client",
-    "dev:worker": "npm run dev --prefix worker"
+    "dev:worker": "npm run dev --prefix worker",
+    "dev:monitor": "npm run dev --prefix monitor"
   },
   "engines": {
     "node": ">=18"

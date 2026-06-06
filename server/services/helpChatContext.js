@@ -116,6 +116,7 @@ function serializePerson(p) {
     availabilityUntil: p.availabilityUntil,
     availabilityReason: p.availabilityReason,
     skills: p.skills,
+    hrPersonId: p.hrPersonId,
   };
 }
 

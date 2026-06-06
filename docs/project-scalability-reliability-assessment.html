@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Project Scalability &amp; Reliability Assessment</title>
+<style>
+  @page { margin: 18mm 16mm; size: A4; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 10.5pt;
+    line-height: 1.45;
+    color: #1a1a1a;
+    max-width: 100%;
+  }
+  h1 { font-size: 20pt; color: #0d3b66; border-bottom: 2px solid #0d3b66; padding-bottom: 6px; margin-top: 0; }
+  h2 { font-size: 14pt; color: #145374; margin-top: 1.2em; page-break-after: avoid; }
+  h3 { font-size: 11.5pt; color: #333; margin-top: 1em; page-break-after: avoid; }
+  h4 { font-size: 10.5pt; color: #444; }
+  p { margin: 0.4em 0; }
+  table { width: 100%; border-collapse: collapse; margin: 0.6em 0; font-size: 9pt; page-break-inside: avoid; }
+  th, td { border: 1px solid #ccc; padding: 5px 7px; text-align: left; vertical-align: top; }
+  th { background: #e8f1f8; font-weight: 600; }
+  tr:nth-child(even) td { background: #f8fafc; }
+  code, pre { font-family: "SF Mono", Menlo, monospace; font-size: 8.5pt; }
+  pre { background: #f4f4f4; padding: 10px; border-radius: 4px; white-space: pre-wrap; page-break-inside: avoid; }
+  code { background: #f0f0f0; padding: 1px 4px; border-radius: 2px; }
+  ul { margin: 0.3em 0 0.6em 1.2em; }
+  li { margin: 0.2em 0; }
+  hr { border: none; border-top: 1px solid #ddd; margin: 1em 0; }
+  strong { color: #111; }
+</style>
+</head>
+<body>
+<h1>Project Scalability &amp; Reliability Assessment</h1>
+<br/>
+<p><strong>System:</strong> AI-Native Organization OS</p>
+<p><strong>Assessment date:</strong> May 24, 2026</p>
+<p><strong>Version assessed:</strong> Current main branch (Postgres-first, single-process API)</p>
+<p><strong>Prepared for:</strong> Platform operations and engineering leadership</p>
+<br/>
+<hr/>
+<br/>
+<h2>Executive summary</h2>
+<br/>
+<p>The AI-Native Organization OS is a <strong>production-capable single-instance coordination platform</strong> with strong <strong>data consistency</strong> primitives (transactional writes, idempotent events, per-project orchestration locks) and <strong>operational reliability</strong> (readiness gates, graceful shutdown, structured errors, health checks). It is <strong>not yet horizontally scalable</strong> without externalizing in-memory state (event log cache, LLM queue, SSE fan-out, orchestration locks).</p>
+<br/>
+<table><tbody>
+<tr><th>Dimension</th><th>Rating (1–5)</th><th>Summary</th></tr>
+<tr><td><strong>Reliability</strong></td><td>4 / 5</td><td>Postgres source of truth, health/shutdown, idempotency, error handling</td></tr>
+<tr><td><strong>Consistency</strong></td><td>4 / 5</td><td>Transactional persist; per-project serialization; replan dedup</td></tr>
+<tr><td><strong>Scalability (vertical)</strong></td><td>3 / 5</td><td>In-memory event log + SSE cap; pool tuning; staggered AI polling</td></tr>
+<tr><td><strong>Scalability (horizontal)</strong></td><td>2 / 5</td><td>Requires Redis/distributed queue before multi-instance</td></tr>
+<tr><td><strong>Observability</strong></td><td>4 / 5</td><td>Ops Monitor, agent activity, LLM logs, unified health API</td></tr>
+<tr><td><strong>Operational readiness</strong></td><td>4 / 5</td><td>Documented env vars, readiness probe, graceful stop</td></tr>
+</tbody></table>
+<br/>
+<p><strong>Recommendation:</strong> Run <strong>one API process per environment</strong> today. Plan <strong>Redis + worker tier</strong> before scaling API replicas or heavy concurrent LLM load.</p>
+<br/>
+<hr/>
+<br/>
+<h2>1. System context</h2>
+<br/>
+<h3>1.1 Purpose</h3>
+<br/>
+<p>The platform automates <strong>corporate coordination</strong> (planning, assignment, scheduling, project monitoring, worker requests) while keeping humans in the loop for judgment and execution. Events drive project state; AI agents react to signals and delegate work.</p>
+<br/>
+<h3>1.2 Architecture (current)</h3>
+<br/>
+<pre><code>
+┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+
+│ Leadership  │  │   Worker    │  │    Ops      │
+
+│   (5173)    │  │   (5174)    │  │  Monitor    │
+
+└──────┬──────┘  └──────┬──────┘  │   (5175)    │
+
+       │                │         └──────┬──────┘
+
+       └────────────────┼────────────────┘
+
+                        │ HTTP + SSE
+
+                 ┌──────▼──────┐
+
+                 │  API Server │  ← single Node.js process (port 3000)
+
+                 │  Express    │
+
+                 └──────┬──────┘
+
+        ┌───────────────┼───────────────┐
+
+        │               │               │
+
+   in-memory        in-process      PostgreSQL
+
+   eventLog         LLM queue       (Neon / Postgres)
+
+   projects         project locks   source of truth
+
+   SSE clients      agent activity
+
+</code></pre>
+<br/>
+<h3>1.3 Technology stack</h3>
+<br/>
+<table><tbody>
+<tr><th>Layer</th><th>Technology</th></tr>
+<tr><td>API</td><td>Node.js 18+, Express</td></tr>
+<tr><td>Database</td><td>PostgreSQL (<code>pg</code> pool, Neon-compatible)</td></tr>
+<tr><td>Real-time</td><td>Server-Sent Events (SSE), capped clients</td></tr>
+<tr><td>AI</td><td>Gemini, OpenAI, DeepSeek, Ollama (optional)</td></tr>
+<tr><td>Frontends</td><td>React 18 + Vite (3 separate apps)</td></tr>
+</tbody></table>
+<br/>
+<hr/>
+<br/>
+<h2>2. Reliability assessment</h2>
+<br/>
+<h3>2.1 Strengths</h3>
+<br/>
+<table><tbody>
+<tr><th>Capability</th><th>Implementation</th><th>Impact</th></tr>
+<tr><td><strong>Persistence before listen</strong></td><td><code>initStore()</code> completes before HTTP accepts traffic</td><td>Avoids serving stale or empty state</td></tr>
+<tr><td><strong>Readiness / liveness</strong></td><td><code>GET /api/health</code> — <code>SELECT 1</code>, <code>storeReady</code>, shutdown flag</td><td>Load balancers can drain unhealthy instances</td></tr>
+<tr><td><strong>Graceful shutdown</strong></td><td><code>SIGTERM</code> / <code>SIGINT</code> → hooks → close HTTP → drain pool</td><td>Clean deploys; in-flight work bounded (15s hook timeout)</td></tr>
+<tr><td><strong>503 during startup/shutdown</strong></td><td>Middleware rejects non-health routes until ready</td><td>Prevents partial writes during boot</td></tr>
+<tr><td><strong>Transactional writes</strong></td><td><code>persistEventAndState()</code> — event + project in one transaction</td><td>Reduces split-brain between event and state</td></tr>
+<tr><td><strong>Idempotent events</strong></td><td><code>eventExistsById</code> + <code>ON CONFLICT DO NOTHING</code> on ingest</td><td>Safe retries from clients and agents</td></tr>
+<tr><td><strong>Standard errors</strong></td><td><code>apiErrors.js</code> — <code>{ error: { code, message } }</code></td><td>Predictable client handling</td></tr>
+<tr><td><strong>SSE backpressure</strong></td><td><code>SSE_MAX_CLIENTS</code> (default 200)</td><td>Limits connection exhaustion</td></tr>
+<tr><td><strong>Pool resilience</strong></td><td>Idle client error handler on <code>pg</code> pool</td><td>Survives transient Neon/Postgres disconnects</td></tr>
+<tr><td><strong>AI handler re-queue</strong></td><td>Re-schedules when prior run still <code>processing</code></td><td>Avoids dropped leadership automation</td></tr>
+<tr><td><strong>Staggered Project AI</strong></td><td>3 projects per poll tick</td><td>Reduces LLM/API thundering herd</td></tr>
+</tbody></table>
+<br/>
+<h3>2.2 Risks and gaps</h3>
+<br/>
+<table><tbody>
+<tr><th>Risk</th><th>Severity</th><th>Notes</th></tr>
+<tr><td><strong>Single process = single point of failure</strong></td><td>High</td><td>No active-active failover without architecture change</td></tr>
+<tr><td><strong>Full event log in memory</strong></td><td>Medium</td><td>Startup load time and RAM grow with event count (~2k+ events observed)</td></tr>
+<tr><td><strong>In-process LLM queue</strong></td><td>Medium</td><td>One global lock; long calls block other agents</td></tr>
+<tr><td><strong>No automated backup/runbook in repo</strong></td><td>Medium</td><td>Depends on Neon/hosting provider RPO/RTO</td></tr>
+<tr><td><strong>No rate limiting on public routes</strong></td><td>Low–Medium</td><td>Abuse or accidental loops could stress DB/LLM</td></tr>
+<tr><td><strong>Agent activity hydrate at startup</strong></td><td>Low</td><td>Monitor history may be sparse until new activity is logged</td></tr>
+</tbody></table>
+<br/>
+<h3>2.3 Reliability scorecard</h3>
+<br/>
+<table><tbody>
+<tr><th>Criteria</th><th>Met?</th><th>Evidence</th></tr>
+<tr><td>Database is source of truth</td><td>Yes</td><td>All durable state via <code>postgresStore</code></td></tr>
+<tr><td>Fail closed on DB down</td><td>Yes</td><td>Health returns 503; startup fails if init fails</td></tr>
+<tr><td>Duplicate events rejected</td><td>Yes</td><td>Memory + DB idempotency check</td></tr>
+<tr><td>Orchestration races per project</td><td>Mitigated</td><td><code>runWithProjectLock(projectId)</code></td></tr>
+<tr><td>Deploy without corrupting state</td><td>Yes</td><td>Graceful shutdown + transactional persist</td></tr>
+</tbody></table>
+<br/>
+<hr/>
+<br/>
+<h2>3. Scalability assessment</h2>
+<br/>
+<h3>3.1 Current scale envelope (estimated)</h3>
+<br/>
+<table><tbody>
+<tr><th>Resource</th><th>Typical dev/staging</th><th>Bottleneck</th></tr>
+<tr><td>Events in DB</td><td>2,000–2,500+</td><td>Memory replay on cold start</td></tr>
+<tr><td>Projects</td><td>7–10</td><td>Project AI poll fan-out</td></tr>
+<tr><td>People</td><td>~20</td><td>Workforce analytics queries</td></tr>
+<tr><td>Worker needs</td><td>300+</td><td>Leadership AI Handler batch (8/run)</td></tr>
+<tr><td>SSE clients</td><td>≤ 200 (configurable)</td><td>Per-process connection limit</td></tr>
+<tr><td>Postgres pool</td><td>2–20 (<code>PG_POOL_MAX</code>)</td><td>Concurrent route handlers</td></tr>
+</tbody></table>
+<br/>
+<p><strong>Suitable today for:</strong> single org pilot, tens of projects, hundreds of events/hour, small leadership + worker cohort.</p>
+<br/>
+<p><strong>Not suitable without changes for:</strong> multiple API replicas, thousands of events/minute, hundreds of simultaneous SSE subscribers across instances.</p>
+<br/>
+<h3>3.2 Vertical scaling (single instance)</h3>
+<br/>
+<table><tbody>
+<tr><th>Lever</th><th>Status</th></tr>
+<tr><td>Increase <code>PG_POOL_MAX</code></td><td>Supported (cap 20)</td></tr>
+<tr><td>Neon pooler connection string</td><td>Recommended in production</td></tr>
+<tr><td><code>OPS_MONITOR_STREAM_HOURS</code></td><td>Tunable monitor window</td></tr>
+<tr><td>Staggered Project AI polling</td><td>Implemented</td></tr>
+<tr><td>Replan dedup (15 min window)</td><td>Reduces redundant LLM work</td></tr>
+</tbody></table>
+<br/>
+<p><strong>Limit:</strong> Node.js single-threaded event loop + in-memory <code>eventLog</code> size + global LLM mutex.</p>
+<br/>
+<h3>3.3 Horizontal scaling (not implemented)</h3>
+<br/>
+<p>To run <strong>N API instances</strong>, the following must be externalized:</p>
+<br/>
+<table><tbody>
+<tr><th>Component</th><th>Today</th><th>Required for scale-out</th></tr>
+<tr><td>Orchestration locks</td><td>In-memory <code>Map</code> per process</td><td>Redis or Postgres advisory locks</td></tr>
+<tr><td>LLM queue</td><td>In-process lock + queue</td><td>Redis queue or dedicated worker service</td></tr>
+<tr><td>SSE broadcasts</td><td>In-memory client set</td><td>Redis pub/sub or SSE gateway</td></tr>
+<tr><td>Event log reads</td><td>Full load into RAM</td><td>Time-window queries or read replicas</td></tr>
+<tr><td>Session / cache (future)</td><td>N/A</td><td>Redis optional</td></tr>
+</tbody></table>
+<br/>
+<p><strong>Documented roadmap:</strong> <code>docs/reliability.md</code> § Horizontal scale (future).</p>
+<br/>
+<h3>3.4 Scalability scorecard</h3>
+<br/>
+<table><tbody>
+<tr><th>Criteria</th><th>Current</th><th>Target (scale-out)</th></tr>
+<tr><td>Stateless API</td><td>No</td><td>Yes, with external locks/queue</td></tr>
+<tr><td>Shared pub/sub</td><td>No</td><td>Redis pub/sub</td></tr>
+<tr><td>DB connection pooling</td><td>Yes</td><td>Neon pooler + right-sized pool per instance</td></tr>
+<tr><td>Background job tier</td><td>Partial (timers in API)</td><td>Dedicated workers for LLM/orchestration</td></tr>
+</tbody></table>
+<br/>
+<hr/>
+<br/>
+<h2>4. Consistency &amp; data integrity</h2>
+<br/>
+<h3>4.1 Write path</h3>
+<br/>
+<p>1. Client posts event → idempotency check (memory + DB).</p>
+<p>2. State mutation in memory → <code>persistEventAndState(event, projectState, needRecord)</code>.</p>
+<p>3. Transaction commits event row + project snapshot (+ need if applicable).</p>
+<p>4. SSE broadcast to connected clients.</p>
+<br/>
+<h3>4.2 Concurrency controls</h3>
+<br/>
+<table><tbody>
+<tr><th>Mechanism</th><th>Scope</th></tr>
+<tr><td><code>runWithProjectLock</code></td><td>One orchestration/replan chain per <code>projectId</code></td></tr>
+<tr><td><code>recentlyReplanned</code></td><td>15-minute dedup window for Project AI replans</td></tr>
+<tr><td>Leadership AI Handler debounce</td><td>1.2s debounce; re-queue if <code>processing</code></td></tr>
+<tr><td>LLM global queue</td><td>Single active model call at a time (per process)</td></tr>
+</tbody></table>
+<br/>
+<h3>4.3 Known consistency caveats</h3>
+<br/>
+<ul>
+<li><strong>Memory vs DB:</strong> In-memory cache is authoritative for reads during runtime; restart reloads from Postgres snapshot + incremental replay.</li>
+<li><strong>Multi-instance:</strong> Without distributed locks, two processes could process the same project concurrently.</li>
+<li><strong>Event ordering:</strong> Per-project lock serializes orchestration; global event order is append-only in DB.</li>
+</ul>
+<br/>
+<hr/>
+<br/>
+<h2>5. Observability &amp; operations</h2>
+<br/>
+<h3>5.1 Monitoring surfaces</h3>
+<br/>
+<table><tbody>
+<tr><th>Surface</th><th>Audience</th><th>Data</th></tr>
+<tr><td><strong>Ops Monitor UI</strong> (<code>/monitor</code>, port 5175)</td><td>Operations</td><td>Agent streams, LLM queue, work boards</td></tr>
+<tr><td><strong><code>GET /api/ops/monitor</code></strong></td><td>Automation</td><td>JSON agent status + stream segments</td></tr>
+<tr><td><strong><code>GET /api/health</code></strong></td><td>Orchestration / K8s</td><td>DB ping, <code>storeReady</code>, uptime</td></tr>
+<tr><td><strong>Agent activity table</strong></td><td>Postgres</td><td>Structured lines for stream history</td></tr>
+<tr><td><strong>LLM logs table</strong></td><td>Postgres</td><td>Prompts/responses per project</td></tr>
+</tbody></table>
+<br/>
+<h3>5.2 Operational procedures</h3>
+<br/>
+<pre><code>
+# Readiness (503 if DB down or still starting)
+
+curl -s http://localhost:3000/api/health
+
+
+
+# Graceful stop
+
+kill -SIGTERM &lt;pid&gt;
+
+</code></pre>
+<br/>
+<p><strong>Post-deploy checklist:</strong> Verify <code>status: "ok"</code> and <code>database: "up"</code> before traffic.</p>
+<br/>
+<h3>5.3 Environment variables (reliability-related)</h3>
+<br/>
+<table><tbody>
+<tr><th>Variable</th><th>Default</th><th>Purpose</th></tr>
+<tr><td><code>DATABASE_URL</code></td><td>required</td><td>Postgres connection</td></tr>
+<tr><td><code>PG_POOL_MAX</code></td><td>10</td><td>Connection pool size (max 20)</td></tr>
+<tr><td><code>PG_CONNECTION_TIMEOUT_MS</code></td><td>10000</td><td>Connect timeout</td></tr>
+<tr><td><code>SSE_MAX_CLIENTS</code></td><td>200</td><td>SSE connection cap</td></tr>
+<tr><td><code>OPS_MONITOR_STREAM_HOURS</code></td><td>3</td><td>Monitor time window</td></tr>
+</tbody></table>
+<br/>
+<hr/>
+<br/>
+<h2>6. Frontend &amp; deployment scalability</h2>
+<br/>
+<table><tbody>
+<tr><th>App</th><th>Deploy model</th><th>Scale notes</th></tr>
+<tr><td>Leadership (<code>client/</code>)</td><td>Static CDN / Vite build</td><td>Horizontally unlimited (stateless)</td></tr>
+<tr><td>Worker (<code>worker/</code>)</td><td>Static CDN</td><td>Same</td></tr>
+<tr><td>Monitor (<code>monitor/</code>)</td><td>Static CDN</td><td>Polls + SSE via API</td></tr>
+<tr><td>API (<code>server/</code>)</td><td>Single Node process</td><td>Scale bottleneck</td></tr>
+</tbody></table>
+<br/>
+<p>Frontends scale independently; <strong>API is the constraint</strong>.</p>
+<br/>
+<hr/>
+<br/>
+<h2>7. Risk register (prioritized)</h2>
+<br/>
+<table><tbody>
+<tr><th>ID</th><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Mitigation</th></tr>
+<tr><td>R1</td><td>API process crash</td><td>Medium</td><td>High</td><td>Health checks, fast restart, Neon durability</td></tr>
+<tr><td>R2</td><td>LLM provider outage</td><td>Medium</td><td>Medium</td><td>Stub mode; queue visibility in Ops Monitor</td></tr>
+<tr><td>R3</td><td>Event log memory growth</td><td>Medium</td><td>Medium</td><td>Archive strategy; windowed load (future)</td></tr>
+<tr><td>R4</td><td>Duplicate orchestration (multi-instance)</td><td>Low today / High if scaled</td><td>High</td><td>Do not run multiple instances until Redis locks</td></tr>
+<tr><td>R5</td><td>SSE connection storm</td><td>Low</td><td>Medium</td><td><code>SSE_MAX_CLIENTS</code>; CDN for static assets</td></tr>
+<tr><td>R6</td><td>Long-running LLM blocking queue</td><td>Medium</td><td>Medium</td><td>External job queue; timeouts (future)</td></tr>
+</tbody></table>
+<br/>
+<hr/>
+<br/>
+<h2>8. Recommendations</h2>
+<br/>
+<h3>8.1 Immediate (0–4 weeks)</h3>
+<br/>
+<p>1. <strong>Run one API instance</strong> per environment; document in runbooks.</p>
+<p>2. <strong>Use Neon pooler URL</strong> in production (<code>-pooler</code> host).</p>
+<p>3. <strong>Wire health checks</strong> to load balancer / platform (503 until <code>storeReady</code>).</p>
+<p>4. <strong>Monitor</strong> via Ops Monitor + periodic <code>GET /api/health</code>.</p>
+<p>5. <strong>Verify idempotency</strong> on critical event producers (clients, webhooks).</p>
+<br/>
+<h3>8.2 Near-term (1–3 months)</h3>
+<br/>
+<p>1. <strong>Introduce Redis</strong> for: distributed orchestration locks, LLM job queue, SSE pub/sub.</p>
+<p>2. <strong>Background worker process</strong> for LLM and heavy Project AI batches.</p>
+<p>3. <strong>Event archival</strong> or time-window hydration to cap memory on startup.</p>
+<p>4. <strong>Rate limiting</strong> on <code>POST /events</code> and LLM-heavy routes.</p>
+<p>5. <strong>Backup / restore drill</strong> with Neon PITR documentation.</p>
+<br/>
+<h3>8.3 Long-term (3–6 months)</h3>
+<br/>
+<p>1. <strong>Multi-instance API</strong> behind load balancer with shared Redis.</p>
+<p>2. <strong>Read replicas</strong> or CQRS for analytics/workforce if query load grows.</p>
+<p>3. <strong>SLOs</strong>: API p99 latency, event ingest success rate, LLM queue wait time.</p>
+<p>4. <strong>Chaos testing</strong>: DB failover, SIGTERM during orchestration.</p>
+<br/>
+<hr/>
+<br/>
+<h2>9. Conclusion</h2>
+<br/>
+<p>The AI-Native Organization OS demonstrates <strong>mature reliability patterns for a single-node coordination service</strong>: transactional persistence, idempotency, health-gated startup, graceful shutdown, and strong operational visibility through the Ops Monitor. <strong>Scalability is intentionally bounded</strong> to one API process until distributed locks and an external LLM queue (Redis-backed) are introduced.</p>
+<br/>
+<p><strong>Overall assessment:</strong> <strong>Reliable for pilot and single-tenant production</strong> at current event/project scale; <strong>scale-out ready in design</strong> with a clear documented path in <code>docs/reliability.md</code>.</p>
+<br/>
+<hr/>
+<br/>
+<h2>Appendix A — Key source files</h2>
+<br/>
+<table><tbody>
+<tr><th>Area</th><th>Path</th></tr>
+<tr><td>Reliability doc</td><td><code>docs/reliability.md</code></td></tr>
+<tr><td>Lifecycle / health</td><td><code>server/lib/platformLifecycle.js</code></td></tr>
+<tr><td>Project locks</td><td><code>server/lib/projectLock.js</code></td></tr>
+<tr><td>API entry</td><td><code>server/index.js</code></td></tr>
+<tr><td>Event persist</td><td><code>server/store/postgresStore.js</code></td></tr>
+<tr><td>Ops monitor</td><td><code>server/services/opsMonitor.js</code></td></tr>
+<tr><td>LLM queue</td><td><code>server/lib/llm.js</code></td></tr>
+</tbody></table>
+<br/>
+<h2>Appendix B — Assessment methodology</h2>
+<br/>
+<p>This assessment is based on:</p>
+<br/>
+<ul>
+<li>Static review of server architecture and reliability modules</li>
+<li>Documented platform behavior in <code>docs/reliability.md</code> and README</li>
+<li>Operational patterns observed during development (health API, Ops Monitor, Postgres counts)</li>
+<li>Industry standards for single-instance Node + Postgres services</li>
+</ul>
+<br/>
+<p>*This document is informational and does not constitute a formal third-party audit.*</p>
+<br/>
+<hr/>
+<br/>
+<p>*AI-Native Organization OS — Scalability &amp; Reliability Assessment — May 2026*</p>
+<br/>
+</body>
+</html>

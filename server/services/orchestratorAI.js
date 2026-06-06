@@ -3,7 +3,7 @@
  * Outputs a structured plan (JSON), not prose. Uses OpenAI when OPENAI_API_KEY is set; otherwise stub.
  */
 
-const { readPrompt, complete, OLLAMA_TOOLS } = require('../lib/llm');
+const { readPrompt, complete, OLLAMA_TOOLS, agentLlmTimeoutMs } = require('../lib/llm');
 const { RISK_LEVELS } = require('../models/eventSchema');
 
 /**
@@ -142,14 +142,13 @@ async function createPlan(requestPayload, projectContext = null, agentContext = 
     2
   );
 
-  const defaultTimeoutMs =
-    String(process.env.LLM_PROVIDER || '').toLowerCase() === 'ollama' ? 60000 : 2500;
-  const timeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS || defaultTimeoutMs);
+  const timeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS || agentLlmTimeoutMs());
   const out = await complete(systemPrompt, userMessage, {
     timeoutMs,
     tools: OLLAMA_TOOLS.orchestrator,
     agent: 'orchestrator',
     projectId: projectContext?.id || undefined,
+    projectTitle: projectContext?.title || requestPayload?.title || undefined,
     context: {
       kind: 'createPlan',
     },

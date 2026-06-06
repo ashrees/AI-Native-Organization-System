@@ -35,11 +35,14 @@ function buildProjectMetrics(projectState, projectEvents) {
   let crossTeamTasks = 0;
 
   for (const task of tasks) {
+    const isReviewTask = String(task.id || '').startsWith('wr-');
     const status = task.status || 'unknown';
-    if (statusCounts[status] != null) {
-      statusCounts[status] += 1;
-    } else {
-      statusCounts.unknown += 1;
+    if (!isReviewTask) {
+      if (statusCounts[status] != null) {
+        statusCounts[status] += 1;
+      } else {
+        statusCounts.unknown += 1;
+      }
     }
 
     if (task.assignee && (task.assignee.id || task.assignee.name)) {
@@ -58,10 +61,12 @@ function buildProjectMetrics(projectState, projectEvents) {
         });
       }
       const entry = peopleMap.get(key);
-      entry.tasksTotal += 1;
-      if (status === 'in_progress') entry.tasksInProgress += 1;
-      if (status === 'done') entry.tasksDone += 1;
-      if (status === 'blocked') entry.tasksBlocked += 1;
+      if (!isReviewTask) {
+        entry.tasksTotal += 1;
+        if (status === 'in_progress') entry.tasksInProgress += 1;
+        if (status === 'done') entry.tasksDone += 1;
+        if (status === 'blocked') entry.tasksBlocked += 1;
+      }
 
       // Cross‑team collaboration: assignee team differs from project team.
       if (task.assignee.team && projectState.team && task.assignee.team !== projectState.team) {
@@ -99,6 +104,17 @@ function buildProjectMetrics(projectState, projectEvents) {
   const blockedRate =
     statusCounts.total > 0 ? statusCounts.blocked / statusCounts.total : null;
 
+  let assignedNonDone = 0;
+  let unscheduledAssigned = 0;
+  for (const task of tasks) {
+    if (task.status === 'done') continue;
+    if (String(task.id || '').startsWith('wr-')) continue;
+    const hasAssignee = task.assigneeId || task.assignee?.id;
+    if (!hasAssignee) continue;
+    assignedNonDone += 1;
+    if (!task.scheduledStart || !task.scheduledEnd) unscheduledAssigned += 1;
+  }
+
   return {
     projectId: projectState.id,
     title: projectState.title,
@@ -109,6 +125,11 @@ function buildProjectMetrics(projectState, projectEvents) {
       sponsor: projectState.sponsor || null,
     },
     tasks: statusCounts,
+    scheduling: {
+      assignedNonDone,
+      unscheduledAssigned,
+      allAssignedScheduled: assignedNonDone > 0 && unscheduledAssigned === 0,
+    },
     blockers: {
       count: blockers.length,
     },

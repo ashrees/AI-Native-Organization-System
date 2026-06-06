@@ -5,6 +5,7 @@
  */
 
 const { EVENT_TYPES, EXECUTION_STATUSES, PROJECT_STATUSES, RISK_LEVELS } = require('./eventSchema');
+const { capRiskReasons } = require('../lib/eventPayload');
 
 /**
  * Creates an empty project state for a given project id.
@@ -18,6 +19,10 @@ function createEmptyState(projectId) {
     team: '',
     sponsor: '',
     status: 'active',
+    archived: false,
+    closedAt: null,
+    archivedAt: null,
+    roles: {},
     progress: {
       tasks: [],
     },
@@ -28,6 +33,7 @@ function createEmptyState(projectId) {
     blockers: [],
     dependencies: [],
     needs: [],
+    finance: null,
     lastUpdatedAt: null,
     lastEventId: null,
   };
@@ -90,8 +96,10 @@ function applyEvent(previousState, event) {
     }
 
     case 'plan_created': {
+      const { isJunkPlanTask } = require('../lib/planTasks');
       const tasks = payload.tasks || (payload.taskIds && payload.taskIds.map((id) => ({ id }))) || [];
       for (const t of tasks) {
+        if (typeof t === 'object' && isJunkPlanTask(t)) continue;
         const taskId = typeof t === 'string' ? t : t.id;
         ensureTask(state, taskId, typeof t === 'object' ? { title: t.title, description: t.description } : {});
       }
@@ -99,6 +107,7 @@ function applyEvent(previousState, event) {
         state.risk.level = payload.riskLevel;
         if (event.rationale) {
           state.risk.reasons.push(event.rationale);
+          state.risk.reasons = capRiskReasons(state.risk.reasons);
         }
       }
       if (payload.dependencies && Array.isArray(payload.dependencies)) {
@@ -111,6 +120,7 @@ function applyEvent(previousState, event) {
       const { taskId, personId, person } = payload || {};
       if (taskId && personId) {
         const task = ensureTask(state, taskId);
+        const previousId = task.assigneeId || task.assignee?.id;
         task.assigneeId = personId;
         if (person && typeof person === 'object') {
           task.assignee = {
@@ -119,7 +129,11 @@ function applyEvent(previousState, event) {
             department: person.department || '',
             team: person.team || '',
             role: person.role || '',
+            projectRoleId: person.projectRoleId || undefined,
+            jobTitle: person.jobTitle || undefined,
           };
+        } else if (previousId && String(previousId) !== String(personId)) {
+          delete task.assignee;
         }
       }
       break;
@@ -181,6 +195,7 @@ function applyEvent(previousState, event) {
         payload || {};
       if (decisionType === 'kill_project' || decisionType === 'kill') {
         state.status = 'killed';
+        state.closedAt = state.closedAt || event.timestamp || new Date().toISOString();
         // Revert all human resources: clear assignees from every task so people are released
         if (state.progress && Array.isArray(state.progress.tasks)) {
           for (const task of state.progress.tasks) {
@@ -190,6 +205,18 @@ function applyEvent(previousState, event) {
         }
       } else if (decisionType === 'complete' || decisionType === 'completed') {
         state.status = 'completed';
+        state.closedAt = state.closedAt || event.timestamp || new Date().toISOString();
+      } else if (decisionType === 'archive_project') {
+        state.archived = true;
+        state.archivedAt = event.timestamp || new Date().toISOString();
+      } else if (decisionType === 'unarchive_project') {
+        state.archived = false;
+      } else if (decisionType === 'reactivate_project') {
+        if (state.status === 'completed') {
+          state.status = 'active';
+          state.archived = false;
+          state.closedAt = null;
+        }
       } else if (decisionType === 'project_assessment') {
         if (riskLevel && RISK_LEVELS.includes(riskLevel)) {
           state.risk.level = riskLevel;
@@ -197,19 +224,110 @@ function applyEvent(previousState, event) {
         const line = riskReason || summary || event.rationale;
         if (line && state.risk.reasons) {
           state.risk.reasons.push(line);
+          state.risk.reasons = capRiskReasons(state.risk.reasons);
         }
         if (suggestProjectCompleted) {
           const tasks = state.progress?.tasks || [];
           const allDone =
             tasks.length > 0 && tasks.every((t) => t.status === 'done');
           const noBlockers = !(state.blockers || []).length;
-          if (allDone && noBlockers) {
-            state.status = 'completed';
+          let deliverableGaps = [];
+          try {
+            if (Array.isArray(payload.deliverableGaps) && payload.deliverableGaps.length > 0) {
+              deliverableGaps = payload.deliverableGaps;
+            } else {
+              const { scanDeliverableGaps, isBudgetDeliverableSatisfied } = require('../services/projectAIDeliverables');
+              deliverableGaps = isBudgetDeliverableSatisfied(state, [])
+                ? []
+                : scanDeliverableGaps(state, []);
+            }
+          } catch {
+            /* optional */
           }
+          if (allDone && noBlockers && deliverableGaps.length === 0) {
+            state.status = 'completed';
+            state.risk.level = 'low';
+            state.risk.reasons = capRiskReasons([
+              riskReason || summary || 'All tasks complete; deliverables confirmed.',
+            ]);
+          }
+        }
+      } else if (decisionType === 'project_roles_assigned') {
+        const roleMap = payload.roles;
+        if (roleMap && typeof roleMap === 'object') {
+          state.roles = { ...(state.roles || {}), ...roleMap };
+          const lead = roleMap.project_lead;
+          if (lead?.name) state.sponsor = lead.name;
+          if (lead?.department && !state.department) state.department = lead.department;
+          if (lead?.team && !state.team) state.team = lead.team;
+        }
+      } else if (decisionType === 'project_member_added') {
+        const member = payload.member;
+        const roleKey = payload.roleKey || (member?.personId ? `contributor_${member.personId}` : null);
+        if (roleKey && member?.personId) {
+          state.roles = { ...(state.roles || {}), [roleKey]: member };
+        }
+      } else if (decisionType === 'consolidate_project_tasks') {
+        const nextTasks = payload.tasks;
+        if (Array.isArray(nextTasks)) {
+          state.progress.tasks = nextTasks.map((t) => ({
+            id: t.id,
+            title: t.title || t.id,
+            description: t.description,
+            status: t.status || 'pending',
+            assigneeId: t.assigneeId,
+            assignee: t.assignee,
+            scheduledStart: t.scheduledStart,
+            scheduledEnd: t.scheduledEnd,
+            requiredDepartments: t.requiredDepartments,
+          }));
+        }
+        if (payload.department) state.department = payload.department;
+        if (payload.team) state.team = payload.team;
+        if (payload.title) state.title = payload.title;
+        const tasks = state.progress?.tasks || [];
+        const allDone = tasks.length > 0 && tasks.every((t) => t.status === 'done');
+        if (!allDone && state.status === 'completed') {
+          state.status = 'active';
+          state.closedAt = null;
+        }
+        state.blockers = (state.blockers || []).filter((b) =>
+          (state.progress.tasks || []).some((t) => t.id === b.taskId && t.status !== 'done')
+        );
+      } else if (
+        decisionType === 'budget_set' ||
+        decisionType === 'budget_burn' ||
+        decisionType === 'budget_increase'
+      ) {
+        const { ensureFinance, appendBurn, defaultFinanceForProject } = require('../lib/projectFinance');
+        if (!state.finance) state.finance = defaultFinanceForProject(state);
+        ensureFinance(state);
+
+        if (decisionType === 'budget_set') {
+          if (payload.budgetTotal != null) state.finance.budgetTotal = Number(payload.budgetTotal);
+          if (payload.revenuePlanned != null) state.finance.revenuePlanned = Number(payload.revenuePlanned);
+          if (payload.currency) state.finance.currency = payload.currency;
+        } else if (decisionType === 'budget_increase') {
+          const add = Number(payload.amount) || 0;
+          state.finance.budgetTotal = (Number(state.finance.budgetTotal) || 0) + add;
+          state.finance.pendingBudgetRequests = Math.max(
+            0,
+            (state.finance.pendingBudgetRequests || 0) - 1
+          );
+        } else if (decisionType === 'budget_burn') {
+          appendBurn(state.finance, {
+            amount: Number(payload.amount) || 0,
+            at: event.timestamp || new Date().toISOString(),
+            reason: payload.reason || event.rationale,
+            taskId: payload.taskId,
+            source: payload.source || 'manual',
+            eventId,
+          });
         }
       }
       if (reason && state.risk.reasons) {
         state.risk.reasons.push(reason);
+        state.risk.reasons = capRiskReasons(state.risk.reasons);
       }
       break;
     }

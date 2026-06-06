@@ -20,6 +20,7 @@ const {
   applyWorkerRequestReview,
 } = require('../lib/workerRequestLifecycle');
 const { activateEmergencyWork, endEmergencyWork, personCanWork } = require('../services/emergencyReturn');
+const { getPersonalHr } = require('../services/personalHr');
 
 function mapWorkerRequestEvent(e, peopleById) {
   const p = e.payload || {};
@@ -31,7 +32,7 @@ function mapWorkerRequestEvent(e, peopleById) {
     title: p.title || p.kind,
     description: p.description,
     status: p.status || 'open',
-    handlingMode: p.handlingMode || 'notify',
+    handlingMode: p.handlingMode || 'ai',
     routingLabel: p.routingLabel || getRoutingForKind(p.kind, e.projectId).label,
     requiresHrInbox: p.requiresHrInbox ?? requestRequiresHrInbox({ kind: p.kind, projectId: e.projectId, ...p }),
     notifyTargets: p.notifyTargets || p.forwardTargets || [],
@@ -43,11 +44,17 @@ function mapWorkerRequestEvent(e, peopleById) {
     primaryReviewerPersonIds: p.primaryReviewerPersonIds || [],
     reviewedByName: p.reviewedByName,
     effectsApplied: p.effectsApplied,
+    effectsError: p.effectsError,
     hrTaskId: p.hrTaskId,
     assignedHrPersonId: p.assignedHrPersonId,
     assignedReviewerPersonId: p.assignedReviewerPersonId,
     projectReviewTaskId: p.projectReviewTaskId,
     aiHandled: !!p.aiHandled,
+    aiAutoApproved: !!p.aiAutoApproved,
+    aiHandlerWatching: !!p.aiHandlerWatching,
+    aiHandlerAssessment: p.aiHandlerAssessment,
+    aiHandlerOversightReason: p.aiHandlerOversightReason,
+    autoApprovedByName: p.autoApprovedByName,
     reviewedBy: p.reviewedBy,
     reviewedAt: p.reviewedAt,
     reviewNotes: p.reviewNotes,
@@ -57,6 +64,13 @@ function mapWorkerRequestEvent(e, peopleById) {
     timestamp: e.timestamp,
     startDate: p.startDate,
     endDate: p.endDate,
+    hrHiringQueue: !!p.hrHiringQueue,
+    hiringRequirements: p.hiringRequirements,
+    hiringProfileId: p.hiringProfileId,
+    hiringProjectId: p.hiringProjectId,
+    hiringStatus: p.hiringStatus,
+    hiredPersonName: p.hiredPersonName,
+    hiringError: p.hiringError,
   };
 }
 
@@ -84,6 +98,9 @@ function buildWorkerDashboard(personId) {
   const people = eventsRouter.loadPeople();
   const person = people.find((p) => p.id === personId);
   if (!person) return null;
+
+  const { personCanWork } = require('../services/emergencyReturn');
+  const reviewerUnavailable = !personCanWork(person);
 
   const { projects } = eventsRouter.getStore();
   const eventLog = eventsRouter.getEventLog();
@@ -113,9 +130,11 @@ function buildWorkerDashboard(personId) {
       tasksDone: mine.filter((t) => t.status === 'done').length,
       tasksBlocked: mine.filter((t) => t.status === 'blocked').length,
       blockers,
+      roles: state.roles || {},
     });
 
     for (const t of mine) {
+      if (reviewerUnavailable && String(t.id || '').startsWith('wr-')) continue;
       tasks.push({
         projectId,
         projectTitle: state.title || projectId,
@@ -211,6 +230,10 @@ function buildWorkerDashboard(personId) {
     requestKinds: WORKER_REQUEST_KINDS,
     handlingModes: HANDLING_MODES,
     isHr: isHrPerson(person),
+    personalHr: (() => {
+      const hr = getPersonalHr(personId, people);
+      return hr ? { id: hr.id, name: hr.name, role: hr.role, department: hr.department } : null;
+    })(),
   };
 }
 
@@ -245,19 +268,24 @@ function buildHrInbox(personId) {
     }
   }
 
-  return { person: { id: person.id, name: person.name, role: person.role }, inbox, hrTasks };
+  const { listHrHiringQueue } = require('../services/hiringNeedHandler');
+  const hiringQueue = listHrHiringQueue(eventLog);
+
+  return {
+    person: { id: person.id, name: person.name, role: person.role },
+    inbox,
+    hrTasks,
+    hiringQueue,
+  };
 }
 
-/** GET /worker/project/inbox?personId= — project-scoped requests this person should review */
-router.get('/project/inbox', (req, res) => {
-  const personId = (req.query.personId || '').trim();
-  if (!personId) return res.status(400).json({ error: 'personId is required' });
-
+/** Project-scoped worker requests this person should review (Worker Portal inbox). */
+function buildProjectInbox(personId) {
   const eventLog = eventsRouter.getEventLog();
   const people = eventsRouter.loadPeople();
   const peopleById = new Map(people.map((p) => [p.id, p]));
 
-  const inbox = eventLog
+  return eventLog
     .filter((e) => e.type === 'need' && e.source === 'human' && e.payload?.personId)
     .map((e) => mapWorkerRequestEvent(e, peopleById))
     .filter((r) => ['open', 'in_review'].includes(r.status))
@@ -272,8 +300,13 @@ router.get('/project/inbox', (req, res) => {
       return notified || assigned;
     })
     .reverse();
+}
 
-  res.json({ inbox });
+/** GET /worker/project/inbox?personId= — project-scoped requests this person should review */
+router.get('/project/inbox', (req, res) => {
+  const personId = (req.query.personId || '').trim();
+  if (!personId) return res.status(400).json({ error: 'personId is required' });
+  res.json({ inbox: buildProjectInbox(personId) });
 });
 
 /** GET /worker/people — list people for name login (?q= partial name) */
@@ -318,6 +351,17 @@ router.get('/meta', (_req, res) => {
     roleDefinitions: Object.values(ROLES).map((r) => ({ id: r.id, label: r.label, agent: r.agent })),
     kindRoutes: KIND_ROUTES,
   });
+});
+
+/** GET /worker/hr/hiring-queue?personId= — open hiring requirements for HR */
+router.get('/hr/hiring-queue', (req, res) => {
+  const personId = (req.query.personId || '').trim();
+  if (!personId) return res.status(400).json({ error: 'personId is required' });
+  const people = eventsRouter.loadPeople();
+  const hr = people.find((p) => p.id === personId);
+  if (!hr || !isHrPerson(hr)) return res.status(403).json({ error: 'HR access only' });
+  const { listHrHiringQueue } = require('../services/hiringNeedHandler');
+  res.json({ hiringQueue: listHrHiringQueue(eventsRouter.getEventLog()) });
 });
 
 /** GET /worker/hr/inbox?personId= — HR queue (HR role only) */
@@ -399,6 +443,130 @@ router.post('/hr/emergency-end', async (req, res) => {
   return res.status(200).json(result);
 });
 
+/** POST /worker/hr/generate-mock — HR previews a random candidate */
+router.post('/hr/generate-mock', async (req, res) => {
+  const hrPersonId = (req.body?.hrPersonId || req.query?.personId || '').trim();
+  const people = eventsRouter.loadPeople();
+  const hr = people.find((p) => p.id === hrPersonId);
+  if (!hr || !isHrPerson(hr)) return res.status(403).json({ error: 'HR access only' });
+
+  try {
+    const { previewMockEmployee } = require('../services/hiringService');
+    const generated = await previewMockEmployee({
+      ...req.body,
+      matchRequirements: !!req.body?.matchRequirements,
+    });
+    return res.json({
+      preview: true,
+      person: generated.person,
+      matchScore: generated.matchScore,
+      profileId: generated.profileId,
+      requirements: generated.requirements,
+    });
+  } catch (err) {
+    console.error('POST /worker/hr/generate-mock error:', err);
+    return res.status(500).json({ error: err.message || 'Generate failed' });
+  }
+});
+
+/** POST /worker/hr/hire — HR adds employee to database */
+router.post('/hr/hire', async (req, res) => {
+  const hrPersonId = (req.body?.hrPersonId || '').trim();
+  const people = eventsRouter.loadPeople();
+  const hr = people.find((p) => p.id === hrPersonId);
+  if (!hr || !isHrPerson(hr)) return res.status(403).json({ error: 'HR access only' });
+
+  const { normalizePersonInput, hireEmployee } = require('../services/hiringService');
+  const normalized = normalizePersonInput(req.body);
+  if (normalized.error) return res.status(400).json({ error: normalized.error });
+
+  try {
+    const result = await hireEmployee(normalized.person, {
+      emitEvent: eventsRouter.emitEvent,
+      getStore: eventsRouter.getStore,
+      refreshPeopleCache: eventsRouter.refreshPeopleCache,
+      recomputePeopleLoad: eventsRouter.recomputePeopleLoadFromProjects,
+      hiredBy: hr.id,
+      hiredByName: hr.name,
+      source: 'human',
+      projectId: req.body?.projectId || null,
+      correlationId: req.body?.correlationId || null,
+      requirements: req.body?.requirements || null,
+    });
+    if (result.error) {
+      const status = result.code === 'duplicate_id' || result.code === 'duplicate_name' ? 409 : 400;
+      return res.status(status).json({ error: result.error });
+    }
+    const needId = (req.body?.needId || req.body?.correlationId || '').trim();
+    if (needId) {
+      const { markHiringNeedHired } = require('../services/hiringNeedHandler');
+      await markHiringNeedHired(needId, result, {
+        updateWorkerRequest: eventsRouter.updateWorkerRequest,
+        getEventLog: eventsRouter.getEventLog,
+      });
+    }
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error('POST /worker/hr/hire error:', err);
+    return res.status(500).json({ error: err.message || 'Hire failed' });
+  }
+});
+
+/** POST /worker/hr/hire-for-requirements — HR/AI-style generate matching hire */
+router.post('/hr/hire-for-requirements', async (req, res) => {
+  const hrPersonId = (req.body?.hrPersonId || '').trim();
+  const people = eventsRouter.loadPeople();
+  const hr = people.find((p) => p.id === hrPersonId);
+  if (!hr || !isHrPerson(hr)) return res.status(403).json({ error: 'HR access only' });
+
+  const { hireFromRequirements } = require('../services/hiringService');
+  try {
+    const result = await hireFromRequirements(req.body || {}, {
+      emitEvent: eventsRouter.emitEvent,
+      getStore: eventsRouter.getStore,
+      refreshPeopleCache: eventsRouter.refreshPeopleCache,
+      recomputePeopleLoad: eventsRouter.recomputePeopleLoadFromProjects,
+      source: 'human',
+      hiredBy: hr.id,
+      hiredByName: hr.name,
+      projectId: req.body?.projectId || null,
+      correlationId: req.body?.correlationId || null,
+    });
+    if (result.error) return res.status(400).json({ error: result.error });
+    const needId = (req.body?.needId || req.body?.correlationId || '').trim();
+    if (needId) {
+      const { markHiringNeedHired } = require('../services/hiringNeedHandler');
+      await markHiringNeedHired(needId, result, {
+        updateWorkerRequest: eventsRouter.updateWorkerRequest,
+        getEventLog: eventsRouter.getEventLog,
+      });
+    }
+    return res.status(201).json(result);
+  } catch (err) {
+    console.error('POST /worker/hr/hire-for-requirements error:', err);
+    return res.status(500).json({ error: err.message || 'Hire failed' });
+  }
+});
+
+/** GET /worker/npc/status — mock human worker NPC simulator */
+router.get('/npc/status', (_req, res) => {
+  const { getMockWorkerStatus } = require('../services/mockWorkerNPC');
+  res.json(getMockWorkerStatus());
+});
+
+/** POST /worker/npc/tick — run one NPC batch now (?personId= optional single worker) */
+router.post('/npc/tick', async (req, res) => {
+  const { runMockWorkerTick, buildMockWorkerCtx } = require('../services/mockWorkerNPC');
+  const personId = (req.body?.personId || req.query?.personId || '').trim() || undefined;
+  try {
+    const summary = await runMockWorkerTick(buildMockWorkerCtx(), { personId });
+    res.json({ ok: true, ...summary });
+  } catch (err) {
+    console.error('POST /worker/npc/tick error:', err);
+    res.status(500).json({ error: err.message || 'NPC tick failed' });
+  }
+});
+
 /** POST /worker/status — update assigned task status */
 router.post('/status', async (req, res) => {
   const result = await eventsRouter.submitWorkerStatus(req.body);
@@ -407,121 +575,21 @@ router.post('/status', async (req, res) => {
 
 /** POST /worker/requests — HR/ops request with routing (AI / notify / self) */
 router.post('/requests', async (req, res) => {
-  const {
-    personId,
-    kind,
-    title,
-    description,
-    projectId,
-    taskId,
-    startDate,
-    endDate,
-    handlingMode,
-  } = req.body || {};
-
-  if (!personId || typeof personId !== 'string' || !personId.trim()) {
-    return res.status(400).json({ error: 'personId is required' });
-  }
-  const people = eventsRouter.loadPeople();
-  if (!people.some((p) => p.id === personId)) {
-    return res.status(404).json({ error: 'Person not found' });
-  }
-  const validKind = WORKER_REQUEST_KINDS.some((k) => k.id === kind);
-  if (!kind || !validKind) {
-    return res.status(400).json({
-      error: `kind must be one of: ${WORKER_REQUEST_KINDS.map((k) => k.id).join(', ')}`,
+  try {
+    const { submitWorkerRequest } = require('../services/workerRequestSubmit');
+    const result = await submitWorkerRequest(req.body || {}, {
+      emitEvent: eventsRouter.emitEvent,
+      getStore: eventsRouter.getStore,
+      loadPeople: eventsRouter.loadPeople,
+      getEventLog: eventsRouter.getEventLog,
+      buildWorkerRequestCtx: eventsRouter.buildWorkerRequestCtx,
+      updateWorkerRequest: eventsRouter.updateWorkerRequest,
     });
+    return res.status(result.status).json(result.body);
+  } catch (err) {
+    console.error('POST /worker/requests error:', err);
+    return res.status(500).json({ error: err.message || 'Failed to submit request' });
   }
-  if (!title || typeof title !== 'string' || !title.trim()) {
-    return res.status(400).json({ error: 'title is required' });
-  }
-  const mode = handlingMode || 'notify';
-  if (!HANDLING_MODES.some((m) => m.id === mode)) {
-    return res.status(400).json({ error: 'handlingMode must be ai, notify, or self' });
-  }
-
-  const pid = (projectId && String(projectId).trim()) || ORG_GENERAL_PROJECT_ID;
-  const { projects } = eventsRouter.getStore();
-  if (pid !== ORG_GENERAL_PROJECT_ID) {
-    const state = projects[pid];
-    if (!state) {
-      return res.status(404).json({ error: 'Project not found' });
-    }
-    const assigned = (state.progress?.tasks || []).some((t) => taskAssigneeId(t) === personId);
-    if (!assigned) {
-      return res.status(400).json({ error: 'Not assigned to this project' });
-    }
-  }
-
-  const person = people.find((p) => p.id === personId);
-  if (person?.availabilityStatus === 'on_leave') {
-    return res.status(400).json({
-      error: `${person.name} is on leave. For urgent work, HR must authorize emergency return (HR inbox → Emergency return, or emergency activate API).`,
-    });
-  }
-  const descParts = [
-    description?.trim(),
-    person ? `Submitted by: ${person.name} (${personId})` : null,
-    startDate ? `Start: ${startDate}` : null,
-    endDate ? `End: ${endDate}` : null,
-  ].filter(Boolean);
-
-  const event = {
-    id: crypto.randomUUID(),
-    type: 'need',
-    timestamp: new Date().toISOString(),
-    projectId: pid,
-    source: 'human',
-    rationale: `${kind}: ${title.trim()}`,
-    payload: {
-      kind,
-      title: title.trim(),
-      description: descParts.join('\n') || title.trim(),
-      status: mode === 'self' ? 'in_review' : 'open',
-      handlingMode: mode,
-      personId,
-      submittedBy: personId,
-      taskId: taskId || undefined,
-      startDate: startDate || undefined,
-      endDate: endDate || undefined,
-      routingLabel: getRoutingForKind(kind, pid).label,
-      requiresHrInbox: !!getRoutingForKind(kind, pid).hrInbox,
-    },
-  };
-
-  await eventsRouter.emitEvent(event);
-
-  const routingResult = await processWorkerRequest(event, eventsRouter.buildWorkerRequestCtx());
-
-  await eventsRouter.updateWorkerRequest(event.id, {
-    status: event.payload.status,
-    notifyTargets: event.payload.notifyTargets,
-    forwardTargets: event.payload.forwardTargets,
-    routingLabel: event.payload.routingLabel,
-    forwardsTo: event.payload.forwardsTo,
-    aiAgent: event.payload.aiAgent,
-    forwardRoles: event.payload.forwardRoles,
-    requiresHrInbox: event.payload.requiresHrInbox,
-    hrTaskId: event.payload.hrTaskId,
-    assignedHrPersonId: event.payload.assignedHrPersonId,
-    assignedReviewerPersonId: event.payload.assignedReviewerPersonId,
-    projectReviewTaskId: event.payload.projectReviewTaskId,
-    roleAssignments: event.payload.roleAssignments,
-    primaryReviewerPersonIds: event.payload.primaryReviewerPersonIds,
-    aiHandled: event.payload.aiHandled,
-    status: event.payload.status,
-  });
-
-  return res.status(201).json({
-    accepted: true,
-    id: event.id,
-    projectId: pid,
-    handlingMode: mode,
-    forwardsTo: event.payload.forwardsTo,
-    aiAgent: event.payload.aiAgent,
-    forwardTargets: routingResult.forwardTargets,
-    roleAssignments: routingResult.assignments || [],
-  });
 });
 
 /** PATCH /worker/requests/:id — assigned reviewer or HR approves / rejects / manages */
@@ -636,5 +704,10 @@ router.post('/requests/:id/tasks', async (req, res) => {
 
   return res.status(201).json({ accepted: true, taskId, assigneeId: assignee.id });
 });
+
+router.buildWorkerDashboard = buildWorkerDashboard;
+router.buildProjectInbox = buildProjectInbox;
+router.buildHrInbox = buildHrInbox;
+router.mapWorkerRequestEvent = mapWorkerRequestEvent;
 
 module.exports = router;

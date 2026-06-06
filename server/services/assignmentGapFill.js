@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const teamBuilderAI = require('./teamBuilderAI');
 const schedulerAI = require('./schedulerAI');
 const { buildAgentContext } = require('./retrieval');
+const { assignTaskToPerson, taskAssigneeId } = require('../lib/taskAssignment');
 const { buildAllProjectMetrics } = require('./metrics');
 const { createEmptyState, findTask } = require('../models/projectState');
 
@@ -18,13 +19,34 @@ function delay(ms) {
 }
 
 function taskIsUnassigned(task) {
-  const aid = task?.assigneeId || task?.assignee?.id;
-  return aid == null || String(aid).trim() === '';
+  return taskAssigneeId(task) == null;
 }
 
-function listUnassignedTasks(projectState) {
-  return (projectState?.progress?.tasks || []).filter(
-    (t) => t.status !== 'done' && taskIsUnassigned(t)
+function isInternalReviewTask(task) {
+  const id = String(task?.id || '');
+  const title = String(task?.title || '').toLowerCase();
+  return id.startsWith('wr-') || title.includes('review worker request');
+}
+
+function assigneeIsUnavailable(task, peopleById) {
+  const aid = taskAssigneeId(task);
+  if (!aid) return false;
+  const person = peopleById.get(aid);
+  const status = person?.availabilityStatus || 'active';
+  return status !== 'active' && status !== 'emergency_active';
+}
+
+function taskNeedsActiveAssignee(task, peopleById) {
+  if (task.status === 'done') return false;
+  if (isInternalReviewTask(task)) return false;
+  if (taskIsUnassigned(task)) return true;
+  return assigneeIsUnavailable(task, peopleById);
+}
+
+function listUnassignedTasks(projectState, people = []) {
+  const peopleById = new Map((people || []).map((p) => [p.id, p]));
+  return (projectState?.progress?.tasks || []).filter((t) =>
+    taskNeedsActiveAssignee(t, peopleById)
   );
 }
 
@@ -49,7 +71,7 @@ function shouldRequestAssignmentGapFill(event, projectState) {
 }
 
 async function assignOneTask(projectId, task, correlationId, assignedInRun, ctx) {
-  const { emitEvent, getStore, loadPeople, incrementPersonLoad, agentLogMessage } = ctx;
+  const { getStore, loadPeople, agentLogMessage } = ctx;
   const people = loadPeople();
   const store = getStore();
   const projectStateCurrent = store.projects[projectId] || createEmptyState(projectId);
@@ -83,8 +105,9 @@ async function assignOneTask(projectId, task, correlationId, assignedInRun, ctx)
   let personId = assignResult?.personId;
   let rationale = assignResult?.rationale;
 
-  if (!personId && people?.length > 0) {
-    const fallback = teamBuilderAI.stubAssign(task, people, projectStateCurrent, {
+  const activePeople = teamBuilderAI.peopleAvailableForAssignment(people);
+  if (!personId && activePeople?.length > 0) {
+    const fallback = teamBuilderAI.stubAssign(task, activePeople, projectStateCurrent, {
       assignedInRun,
       agentContext: teamBuilderContext,
     });
@@ -101,44 +124,27 @@ async function assignOneTask(projectId, task, correlationId, assignedInRun, ctx)
 
   assignedInRun[personId] = (assignedInRun[personId] || 0) + 1;
   const person = people.find((p) => p.id === personId) || null;
-  const assignmentEvent = {
-    id: crypto.randomUUID(),
-    type: 'assignment',
-    timestamp: new Date().toISOString(),
+  const projectStateForSnapshot = getStore().projects[projectId] || projectStateCurrent;
+  const { buildAssigneeSnapshot } = require('../lib/projectMemberRoles');
+  const assigneeSnapshot = buildAssigneeSnapshot(person, projectStateForSnapshot);
+
+  const result = await assignTaskToPerson(ctx, {
     projectId,
-    source: 'team_builder',
+    task,
+    personId,
+    person: assigneeSnapshot,
     correlationId,
     rationale: agentLogMessage(rationale) || `Assigned for unassigned work (${task.title || task.id}).`,
-    payload: {
-      taskId: task.id,
-      personId,
-      person: person
-        ? {
-            id: person.id,
-            name: person.name,
-            department: person.department,
-            team: person.team,
-            role: person.role,
-          }
-        : undefined,
-      assignmentGapFill: true,
-    },
-  };
-  await emitEvent(assignmentEvent);
-  await incrementPersonLoad(personId);
+    source: 'team_builder',
+    payloadExtra: { assignmentGapFill: true },
+  });
+
+  if (!result.assigned) return null;
 
   return {
     ...task,
     assigneeId: personId,
-    assignee: person
-      ? {
-          id: person.id,
-          name: person.name,
-          department: person.department,
-          team: person.team,
-          role: person.role,
-        }
-      : undefined,
+    assignee: assigneeSnapshot || undefined,
   };
 }
 
@@ -224,6 +230,24 @@ async function fillAssignmentGaps(projectId, triggerEvent, ctx) {
     assignedIds.length > 0
       ? `Assignment gap fill: Team Builder assigned ${assignedIds.length} unassigned task(s).`
       : `Assignment gap fill: no assignees found for ${unassigned.length} unassigned task(s).`;
+
+  if (assignedIds.length === 0 && unassigned.length > 0) {
+    try {
+      const { emitHrHiringNeedForStaffingGap } = require('./hiringNeedHandler');
+      await emitHrHiringNeedForStaffingGap(
+        projectId,
+        {
+          unassignedCount: unassigned.length,
+          taskTitles: unassigned.slice(0, 5).map((t) => t.title || t.id),
+          triggerEventId: triggerEvent?.id,
+          description: summary,
+        },
+        ctx
+      );
+    } catch (err) {
+      console.warn('[Assignment gap fill] HR hiring need skipped:', err.message);
+    }
+  }
 
   await emitEvent({
     id: crypto.randomUUID(),

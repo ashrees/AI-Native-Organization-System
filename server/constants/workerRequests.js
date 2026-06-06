@@ -5,8 +5,8 @@
 const HANDLING_MODES = Object.freeze([
   {
     id: 'ai',
-    label: 'AI agents handle',
-    description: 'AI agents create review tasks and assign each target role automatically.',
+    label: 'AI agents handle (autonomous)',
+    description: 'Org AI routes the request, approves it, and applies effects automatically—no leadership approval queue.',
   },
   {
     id: 'notify',
@@ -37,12 +37,29 @@ const WORKER_REQUEST_KINDS = Object.freeze(
     ['vacation', 'Vacation / PTO', 'Planned time away'],
     ['project_transfer', 'Project transfer', 'Move to a different project or team'],
     ['workload_concern', 'Workload concern', 'Too many assignments or unrealistic deadlines'],
+    [
+      'capacity',
+      'Team capacity',
+      'Additional team capacity for tasks (design, engineering, delivery)',
+    ],
     ['project_contribution_change', 'Stop or change project contribution', 'Reduce or end work on a project'],
     ['schedule_change', 'Schedule change', 'Shift or timeline adjustment'],
     ['blocker_escalation', 'Blocker escalation', 'Blocked and need leadership help'],
     ['role_change', 'Role / responsibility change', 'Change in role or scope'],
     ['training', 'Training / learning', 'Request training or mentorship'],
     ['equipment', 'Tools / access', 'Software, hardware, or access needs'],
+    ['team_member', 'Add team member', 'Add a person to the project team'],
+    ['onboarding', 'Onboarding', 'Onboard someone onto the project with access and initial assignments'],
+    [
+      'hiring_request',
+      'Hiring / new expertise',
+      'Recruit or hire when required skills or people are not available in the roster',
+    ],
+    [
+      'budget_request',
+      'Additional budget',
+      'Request more project budget when spend approaches or exceeds allocation',
+    ],
     ['general', 'General request', 'Other workplace request'],
     [
       'emergency_return',

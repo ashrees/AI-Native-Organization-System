@@ -3,7 +3,7 @@
  * Respects availability (mocked for MVP). Uses OpenAI when OPENAI_API_KEY is set; otherwise stub.
  */
 
-const { readPrompt, complete, OLLAMA_TOOLS } = require('../lib/llm');
+const { readPrompt, complete, OLLAMA_TOOLS, agentLlmTimeoutMs } = require('../lib/llm');
 
 /**
  * Stub schedule when LLM is unavailable or fails: sequential one-day slots.
@@ -68,13 +68,14 @@ async function proposeSchedule(tasks, options = {}) {
   );
 
   const defaultTimeoutMs =
-    String(process.env.LLM_PROVIDER || '').toLowerCase() === 'ollama' ? 60000 : 2500;
+    agentLlmTimeoutMs();
   const timeoutMs = Number(process.env.AGENT_LLM_TIMEOUT_MS || defaultTimeoutMs);
   const out = await complete(systemPrompt, userMessage, {
     timeoutMs,
     tools: OLLAMA_TOOLS.scheduler,
     agent: 'scheduler',
     projectId: options.agentContext?.projectSnapshot?.id || undefined,
+    projectTitle: options.agentContext?.projectSnapshot?.title || undefined,
     context: {
       kind: 'proposeSchedule',
     },

@@ -75,6 +75,9 @@ function getProjectSnapshot(projectId, projectsMap) {
             status: t.status,
             assigneeId: t.assigneeId,
             assignee: t.assignee,
+            scheduledStart: t.scheduledStart || null,
+            scheduledEnd: t.scheduledEnd || null,
+            hasSchedule: Boolean(t.scheduledStart && t.scheduledEnd),
           })),
         }
       : { tasks: [] },

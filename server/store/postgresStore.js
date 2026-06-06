@@ -4,6 +4,7 @@
  */
 
 const { pool } = require('../db');
+const { sanitizeEventPayload, sanitizeEventForStorage } = require('../lib/eventPayload');
 
 const SCHEMA = (process.env.POSTGRES_SCHEMA || 'public').replace(/["']/g, '');
 function table(name) {
@@ -89,6 +90,36 @@ const CREATE_LLM_LOGS = `
   );
 `;
 
+const CREATE_USER_PREFERENCES = `
+  CREATE TABLE IF NOT EXISTS ${table('user_preferences')} (
+    person_id   text NOT NULL,
+    pref_key    text NOT NULL,
+    value       jsonb NOT NULL DEFAULT '{}',
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (person_id, pref_key)
+  );
+`;
+
+/** Structured agent activity for Ops Monitor streams (reusable across restarts). */
+const CREATE_AGENT_ACTIVITY = `
+  CREATE TABLE IF NOT EXISTS ${table('agent_activity')} (
+    id                   text PRIMARY KEY,
+    agent_id             text NOT NULL,
+    project_id           text,
+    task_id              text,
+    record_kind          text NOT NULL DEFAULT 'activity',
+    event_type           text,
+    status               text,
+    summary              text NOT NULL DEFAULT '',
+    rationale            text,
+    message              text,
+    is_error             boolean NOT NULL DEFAULT false,
+    correlation_event_id text,
+    project_title        text,
+    created_at           timestamptz NOT NULL DEFAULT now()
+  );
+`;
+
 const DEFAULT_PEOPLE = [
   { id: 'person-1', name: 'Alex Rivera', department: 'Engineering', team: 'Auth', role: 'Senior Backend Engineer', skills: ['backend', 'node', 'api', 'auth'], currentLoad: 0 },
   { id: 'person-2', name: 'Sam Lee', department: 'Engineering', team: 'Frontend', role: 'Frontend Engineer', skills: ['frontend', 'react', 'design-systems'], currentLoad: 0 },
@@ -123,6 +154,7 @@ function rowToPerson(r) {
       : null,
     availabilityReason: r.availability_reason || null,
     activeNeedId: r.active_need_id || null,
+    hrPersonId: r.hr_person_id || null,
   };
 }
 
@@ -156,6 +188,22 @@ async function ensurePeopleAvailabilityColumns() {
   await pool.query(
     `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS active_need_id text`
   );
+  await pool.query(
+    `ALTER TABLE ${table('people')} ADD COLUMN IF NOT EXISTS hr_person_id text`
+  );
+}
+
+async function ensureAgentActivityIndexes() {
+  if (!pool) return;
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_agent_activity_agent_time ON ${table('agent_activity')} (agent_id, created_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_agent_activity_project_time ON ${table('agent_activity')} (project_id, created_at DESC)`
+  );
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_agent_activity_created ON ${table('agent_activity')} (created_at DESC)`
+  );
 }
 
 async function ensureTables() {
@@ -167,28 +215,154 @@ async function ensureTables() {
   await pool.query(CREATE_NEEDS);
   await pool.query(CREATE_PROJECT_TASK_INDEX);
   await pool.query(CREATE_LLM_LOGS);
+  await pool.query(CREATE_USER_PREFERENCES);
+  await pool.query(CREATE_AGENT_ACTIVITY);
+  await ensureAgentActivityIndexes();
+}
+
+/**
+ * Persist one agent activity row (activity log line or mirrored event).
+ * @param {object} record — from activityRecord.fromActivityLogEntry / fromEvent
+ */
+async function insertAgentActivity(record) {
+  if (!pool || !record?.id || !record.agentId) return;
+  await pool.query(
+    `INSERT INTO ${table('agent_activity')}
+     (id, agent_id, project_id, task_id, record_kind, event_type, status, summary, rationale, message,
+      is_error, correlation_event_id, project_title, created_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT (id) DO NOTHING`,
+    [
+      record.id,
+      record.agentId,
+      record.projectId,
+      record.taskId,
+      record.recordKind || 'activity',
+      record.eventType || null,
+      record.status || null,
+      record.summary || '',
+      record.rationale || null,
+      record.message || null,
+      !!record.isError,
+      record.correlationEventId || null,
+      record.projectTitle || null,
+      record.createdAt || new Date().toISOString(),
+    ]
+  );
+}
+
+/**
+ * Load agent activity since a timestamp (for monitor streams).
+ */
+async function loadAgentActivitySince(opts = {}) {
+  if (!pool) return [];
+  const { rowToActivityRecord } = require('../models/activityRecord');
+  const since = opts.since || new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const limit = Math.min(10000, Math.max(100, opts.limit || 5000));
+  const params = [since];
+  let sql = `SELECT * FROM ${table('agent_activity')} WHERE created_at >= $1`;
+  if (opts.agentId) {
+    params.push(opts.agentId);
+    sql += ` AND agent_id = $${params.length}`;
+  }
+  sql += ` ORDER BY created_at ASC LIMIT ${limit}`;
+  const { rows } = await pool.query(sql, params);
+  return rows.map(rowToActivityRecord);
+}
+
+/**
+ * Check whether an event id already exists in Postgres (authoritative idempotency).
+ */
+async function eventExistsById(eventId) {
+  if (!pool || !eventId) return false;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM ${table('events')} WHERE id = $1 LIMIT 1`,
+    [eventId]
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Atomically persist event + project state (+ optional need row).
+ * @returns {{ inserted: boolean }}
+ */
+async function persistEventAndState(event, projectState, needRecord = null) {
+  if (!pool) throw new Error('Database not configured');
+  const stored = sanitizeEventForStorage(event);
+  const projectId = stored.projectId;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const ins = await client.query(
+      `INSERT INTO ${table('events')} (id, type, timestamp, project_id, source, correlation_id, rationale, payload)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (id) DO NOTHING
+       RETURNING id`,
+      [
+        stored.id,
+        stored.type,
+        stored.timestamp,
+        projectId,
+        stored.source,
+        stored.correlationId || null,
+        stored.rationale || null,
+        stored.payload,
+      ]
+    );
+    if (ins.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return { inserted: false };
+    }
+    if (projectState) {
+      const lastUpdatedAt = projectState.lastUpdatedAt || new Date().toISOString();
+      const lastEventId = projectState.lastEventId || stored.id;
+      await client.query(
+        `INSERT INTO ${table('projects')} (id, state, last_updated_at, last_event_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (id)
+         DO UPDATE SET state = EXCLUDED.state, last_updated_at = EXCLUDED.last_updated_at, last_event_id = EXCLUDED.last_event_id`,
+        [projectId, projectState, lastUpdatedAt, lastEventId]
+      );
+    }
+    if (needRecord?.id) {
+      const now = new Date().toISOString();
+      await client.query(
+        `INSERT INTO ${table('needs')} (id, project_id, task_id, source, kind, description, status, event_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (id)
+         DO UPDATE SET status = EXCLUDED.status, updated_at = EXCLUDED.updated_at`,
+        [
+          needRecord.id,
+          needRecord.projectId || projectId,
+          needRecord.taskId || null,
+          needRecord.source || 'system',
+          needRecord.kind || 'general',
+          needRecord.description || '',
+          needRecord.status || 'open',
+          needRecord.eventId || needRecord.id,
+          needRecord.createdAt || now,
+          now,
+        ]
+      );
+    }
+    await client.query('COMMIT');
+    return { inserted: true };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /**
  * Append a single event to the database. Idempotent: ON CONFLICT (id) DO NOTHING.
+ * @returns {Promise<boolean>} true if inserted
  */
 async function appendEvent(event) {
-  if (!pool) return;
-  await pool.query(
-    `INSERT INTO ${table('events')} (id, type, timestamp, project_id, source, correlation_id, rationale, payload)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (id) DO NOTHING`,
-    [
-      event.id,
-      event.type,
-      event.timestamp,
-      event.projectId,
-      event.source,
-      event.correlationId || null,
-      event.rationale || null,
-      event.payload,
-    ]
-  );
+  if (!pool) return false;
+  const { inserted } = await persistEventAndState(event, null, null);
+  return inserted;
 }
 
 /**
@@ -265,17 +439,19 @@ async function upsertPerson(person) {
   const availabilityUntil = person.availabilityUntil || null;
   const availabilityReason = person.availabilityReason || null;
   const activeNeedId = person.activeNeedId || null;
+  const hrPersonId = person.hrPersonId || null;
   await pool.query(
     `INSERT INTO ${table('people')} (id, name, department, team, role, skills, current_load,
-       availability_status, availability_until, availability_reason, active_need_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+       availability_status, availability_until, availability_reason, active_need_id, hr_person_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (id)
      DO UPDATE SET name = EXCLUDED.name, department = EXCLUDED.department, team = EXCLUDED.team,
        role = EXCLUDED.role, skills = EXCLUDED.skills, current_load = EXCLUDED.current_load,
        availability_status = EXCLUDED.availability_status,
        availability_until = EXCLUDED.availability_until,
        availability_reason = EXCLUDED.availability_reason,
-       active_need_id = EXCLUDED.active_need_id`,
+       active_need_id = EXCLUDED.active_need_id,
+       hr_person_id = COALESCE(EXCLUDED.hr_person_id, ${table('people')}.hr_person_id)`,
     [
       id,
       name,
@@ -288,6 +464,7 @@ async function upsertPerson(person) {
       availabilityUntil,
       availabilityReason,
       activeNeedId,
+      hrPersonId,
     ]
   );
 }
@@ -470,6 +647,27 @@ async function loadLlmLogs(options = {}) {
 }
 
 /**
+ * LLM calls since a timestamp (for llm_queue monitor stream).
+ */
+async function loadLlmLogsSince(opts = {}) {
+  if (!pool) return [];
+  const since = opts.since || new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+  const limit = Math.min(2000, Math.max(50, opts.limit || 500));
+  const { rows } = await pool.query(
+    `SELECT id, created_at AS "createdAt", agent, provider, model, project_id AS "projectId",
+            context, error,
+            LEFT(system_prompt, 240) AS "systemPrompt",
+            LEFT(user_message, 400) AS "userMessage"
+     FROM ${table('llm_logs')}
+     WHERE created_at >= $1
+     ORDER BY created_at ASC
+     LIMIT ${limit}`,
+    [since]
+  );
+  return rows;
+}
+
+/**
  * If people table is empty, insert default people. Safe to call on every startup.
  */
 async function ensureDefaultPeople() {
@@ -479,6 +677,35 @@ async function ensureDefaultPeople() {
   for (const p of DEFAULT_PEOPLE) {
     await upsertPerson(p);
   }
+}
+
+/**
+ * Load all preferences for a person (theme, UI settings — replaces browser localStorage for workers).
+ */
+async function loadUserPreferences(personId) {
+  if (!pool || !personId) return {};
+  const { rows } = await pool.query(
+    `SELECT pref_key, value FROM ${table('user_preferences')} WHERE person_id = $1`,
+    [personId]
+  );
+  const out = {};
+  for (const r of rows) {
+    out[r.pref_key] = r.value;
+  }
+  return out;
+}
+
+async function upsertUserPreference(personId, prefKey, value) {
+  if (!pool || !personId || !prefKey) return;
+  // jsonb requires valid JSON; bare strings like light must be JSON-encoded ("light").
+  const jsonPayload = JSON.stringify(value);
+  await pool.query(
+    `INSERT INTO ${table('user_preferences')} (person_id, pref_key, value, updated_at)
+     VALUES ($1, $2, $3::jsonb, now())
+     ON CONFLICT (person_id, pref_key)
+     DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [personId, prefKey, jsonPayload]
+  );
 }
 
 /**
@@ -495,11 +722,13 @@ async function getConnectionDiagnostic() {
           (SELECT count(*) FROM ${table('projects')}) AS projects,
           (SELECT count(*) FROM ${table('people')}) AS people,
           (SELECT count(*) FROM ${table('needs')}) AS needs,
-          (SELECT count(*) FROM ${table('llm_logs')}) AS llm_logs`
+          (SELECT count(*) FROM ${table('llm_logs')}) AS llm_logs,
+          (SELECT count(*) FROM ${table('agent_activity')}) AS agent_activity`
       ),
     ]);
     const { db, schema } = dbRes.rows[0] || {};
-    const { events, projects, people, needs, llm_logs: llmLogs } = countRes.rows[0] || {};
+    const { events, projects, people, needs, llm_logs: llmLogs, agent_activity: agentActivity } =
+      countRes.rows[0] || {};
     return {
       database: db,
       schema,
@@ -508,6 +737,7 @@ async function getConnectionDiagnostic() {
       people: Number(people) || 0,
       needs: Number(needs) || 0,
       llmLogs: Number(llmLogs) || 0,
+      agentActivity: Number(agentActivity) || 0,
     };
   } catch (err) {
     return { error: err.message };
@@ -516,6 +746,8 @@ async function getConnectionDiagnostic() {
 
 module.exports = {
   ensureTables,
+  eventExistsById,
+  persistEventAndState,
   appendEvent,
   updateEventPayload,
   loadAllEvents,
@@ -534,4 +766,9 @@ module.exports = {
    loadLlmLogs,
   ensureDefaultPeople,
   getConnectionDiagnostic,
+  loadUserPreferences,
+  upsertUserPreference,
+  insertAgentActivity,
+  loadAgentActivitySince,
+  loadLlmLogsSince,
 };

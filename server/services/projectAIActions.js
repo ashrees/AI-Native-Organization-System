@@ -69,7 +69,24 @@ function normalizeAgentActions(raw, metrics, projectState, store) {
       payload: item.payload && typeof item.payload === 'object' ? item.payload : undefined,
     });
   }
-  return out.length > 0 ? out : stubAgentActions(metrics, projectState, store);
+  const merged = out.length > 0 ? out : stubAgentActions(metrics, projectState, store);
+  return pruneAgentActions(merged, projectState);
+}
+
+/** Drop scheduler/reschedule when every assigned task already has dates. */
+function pruneAgentActions(actions, projectState) {
+  const needsSchedule = tasksNeedingSchedule(projectState);
+  return (actions || []).filter((a) => {
+    if (a.agent === 'scheduler' && a.action === 'reschedule') {
+      if (needsSchedule.length === 0) return false;
+      if (Array.isArray(a.taskIds) && a.taskIds.length > 0) {
+        const needIds = new Set(needsSchedule.map((t) => String(t.id)));
+        return a.taskIds.some((id) => needIds.has(String(id)));
+      }
+      return true;
+    }
+    return true;
+  });
 }
 
 function stubAgentActions(metrics, projectState, store) {
@@ -243,6 +260,7 @@ async function createNeed(projectId, payload, correlationId, ctx) {
     rationale: description,
     payload: {
       kind,
+      title: payload?.title || undefined,
       description,
       taskId: payload?.taskId || undefined,
       status: 'open',
@@ -329,7 +347,10 @@ module.exports = {
   VALID_ACTIONS,
   normalizeAgentActions,
   stubAgentActions,
+  pruneAgentActions,
   executeAgentActions,
-  recentlyReplanned,
+  recentlyReplanned, // exported for replan deduplication in events router
   tasksNeedingSchedule,
+  rescheduleTasks,
+  triggerReplan,
 };

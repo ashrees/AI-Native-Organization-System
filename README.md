@@ -50,24 +50,26 @@ Modern teams lose time to status meetings, fragmented tools, and manual triage. 
 |--------|------------|
 | API | Node.js 18+, Express |
 | Persistence | PostgreSQL via `pg` |
-| AI | Google Gemini, OpenAI, or Ollama Cloud / local (optional; stubs without keys) |
+| AI | Google Gemini, OpenAI, DeepSeek, or Ollama Cloud / local (optional; stubs without keys) |
 | Leadership UI | React 18, Vite 5 (`client/`, port 5173) |
 | Worker UI | React 18, Vite 5 (`worker/`, port 5174) — separate deploy |
+| Ops Monitor UI | React 18, Vite 5 (`monitor/`, port 5175) — separate deploy |
 | Real-time | Server-Sent Events (SSE) |
 
 ---
 
 ## Applications
 
-Three apps share one API; each can be hosted independently.
+Four apps share one API; each can be hosted independently.
 
 | App | Path | Port (dev) | Audience |
 |-----|------|------------|----------|
 | **API server** | `server/` | 3000 | All clients |
-| **Leadership View** | `client/` | 5173 | Executives — overview, projects, workforce, actions, logs, help chat |
+| **Leadership View** | `client/` | 5173 | Executives — overview, projects, workforce, revenue, actions, logs, help chat |
 | **Worker Portal** | `worker/` | 5174 | Individual contributors — tasks, status, HR/ops requests |
+| **Operations Monitor** | `monitor/` | 5175 | Ops — agent uptime streams, LLM queue, work boards (worked / active / queued / broken) |
 
-Leadership View links to the Worker Portal via `VITE_WORKER_PORTAL_URL`. The Worker Portal links back via `VITE_LEADERSHIP_URL`.
+Leadership View links to Worker Portal and Ops Monitor. Worker Portal and Ops Monitor link back to Leadership.
 
 ---
 
@@ -78,12 +80,21 @@ Leadership View links to the Worker Portal via `VITE_WORKER_PORTAL_URL`. The Wor
 - **Overview** — org metrics and AI-generated insights (background refresh)  
 - **Projects** — live state, tasks, assignees, blockers, risk; **What changed recently** (newest first, human + AI rationale)  
 - **Workforce** — productivity matrix, health scores (0–100), department charts, per-person detail  
+- **Revenue** — per-project budget, spend, utilization, 7-day burn, runway; set budget, record burn, budget requests  
 - **Actions** — submit `request`, human `execution`, and `decision` events; assignment gap-fill checkbox  
 - **Log** — orchestrator, team_builder, scheduler, project_ai, org_ai activity  
 - **LLM Logs** — full prompts and responses per project  
 - **Worker requests** — all human `need` events; leadership approve/reject/close  
 - **Help chat** (floating) — full org snapshot + workforce analytics; routes to Org AI, Orchestrator, Project AI, Team Builder, Scheduler  
 - **Dark / light theme**, SSE live refresh  
+
+### Operations Monitor (`monitor/`)
+
+- **Agent uptime streams** — clickable time bars per agent (default last 3h); pin a segment to read tasks, projects, and rationale  
+- **LLM queue** — live lock state + model calls (agent, action, project); merges `llm_logs` and `agent_activity`  
+- **Work boards** — worked, in progress, in line, broken/errors  
+- **Live refresh** — SSE on events + 5s poll · `GET /api/ops/monitor`  
+- See [`monitor/README.md`](monitor/README.md)
 
 ### Worker Portal (`worker/`)
 
@@ -109,6 +120,7 @@ Every request **kind** maps to specific **roles** and an **AI coordinating agent
 | Blocker escalation | Project lead + team + engineering mgmt | `orchestrator` |
 | Project transfer | HR + project + engineering mgmt | `orchestrator` |
 | Equipment | DevOps + HR | `scheduler` |
+| Budget request | Finance + project lead | `org_ai` |
 | General (on a project) | Project lead + team | `org_ai` |
 | Emergency return | HR only | `org_ai` |
 
@@ -119,10 +131,37 @@ Project-scoped items (e.g. workload on `proj-native-app`) go to **Project review
 When HR or leadership **approves** a worker request, the system updates more than status:
 
 - **Sick leave / vacation** — person marked `on_leave`; unassigned from all active project tasks (`unassignment` events); per-project **leave notice** in “What changed recently”; open review tasks for that employee cancelled  
-- **Transfer / stop contribution** — removed from target project (or all projects)  
+- **Transfer / stop contribution** — removed from target project (or all projects for org-wide transfer)  
+- **Role change** — updates the person’s **role in the directory**; **does not** remove them from project tasks  
 - **On leave** — cannot submit new requests until HR authorizes **emergency return**  
-- **Team Builder** — skips people on leave; includes people in `emergency_active`  
+- **Team Builder / review routing** — skips people on leave; includes people in `emergency_active`  
 - **Startup reconciliation** — approved requests missing effects are backfilled once on server start  
+
+### Essential project roles (new projects)
+
+When the **first request** creates a project, the Orchestrator assigns **essential roles** separately from delivery tasks:
+
+| Role | Purpose |
+|------|---------|
+| Project Lead | Delivery accountability, sponsor on project card |
+| Technical Lead | Architecture and engineering quality |
+| Delivery Owner | Milestones and execution tracking |
+| HR Liaison | Project workforce / people contact |
+
+Stored in `project.roles` (Postgres `projects.state`) via `decision (project_roles_assigned)`. Delivery tasks in the plan are **work only** — no “assign project lead” tasks.
+
+### Personal HR partner
+
+Every employee has `hr_person_id` in Postgres (assigned on startup, round-robin across HR staff). Worker requests route to **your personal HR** first. Shown on the Worker Portal header as “Your HR partner: …”.
+
+### User preferences (Postgres)
+
+Theme and UI prefs persist in `user_preferences` (not only browser localStorage):
+
+- `GET/PATCH /api/preferences?personId=` — keys: `theme`, `lastProjectId`, `helpChatOpen`
+- Leadership uses `personId=leadership`; workers use their `personId`
+
+Run `node server/scripts/sync-postgres-store.js` to rebuild project state, loads, task index, and HR assignments from the event log.
 
 ### Emergency return to work
 
@@ -153,9 +192,22 @@ API: `POST /worker/hr/emergency-activate`, `POST /worker/hr/emergency-end`.
 | **System** | `create_need` | Human input required (approval, unblock, capacity) |
 
 - Updates project **risk level**; may mark **completed** when all tasks are done  
+- **Deliverable gaps** — detects budget/report gaps from events; satisfied when budget tasks are done and finance needs are approved (avoids approval loops)  
 - Visible under **What changed recently** and **Log**  
 
 Env: `PROJECT_AI_DEBOUNCE_MS` (default 15s), `PROJECT_AI_POLL_INTERVAL_MS` (default 300000; `0` disables polling).
+
+### Revenue & project budgets
+
+Leadership **Revenue** tab and `GET /api/revenue/analytics`:
+
+- Per-project budget, spend, remaining, utilization %, 7-day burn, runway  
+- Department rollups and matrix view  
+- `POST /api/revenue/projects/:id/budget` — set budget  
+- `POST /api/revenue/projects/:id/burn` — record spend  
+- `POST /api/revenue/projects/:id/budget-request` — request additional budget  
+
+Finance state lives in `projects.state.finance` (event-sourced via decisions).
 
 Blocked tasks still trigger **immediate Orchestrator replan** in addition to Project AI review.
 
@@ -223,6 +275,7 @@ See [`docs/event-model.md`](docs/event-model.md).
 |-------------|---------|
 | **Google Gemini API key** | `GOOGLE_API_KEY` or `GEMINI_API_KEY` |
 | **OpenAI API key** | `OPENAI_API_KEY` |
+| **DeepSeek** | `DEEPSEEK_API_KEY` + `LLM_PROVIDER=deepseek` ([API keys](https://platform.deepseek.com/api_keys)) |
 | **Ollama Cloud** (recommended) | `OLLAMA_API_KEY` + `https://ollama.com` |
 | **Ollama local** | `http://localhost:11434` or local app proxy to Cloud |
 
@@ -235,6 +288,7 @@ Without an API key, agents use **deterministic stubs** so you can demo the full 
 | `3000` | Express API |
 | `5173` | Leadership View |
 | `5174` | Worker Portal |
+| `5175` | Operations Monitor |
 
 ---
 
@@ -250,6 +304,7 @@ npm install
 cd server && npm install && cd ..
 cd client && npm install && cd ..
 cd worker && npm install && cd ..
+cd monitor && npm install && cd ..
 ```
 
 ### 2. Configure environment
@@ -296,6 +351,13 @@ npm run dev:worker
 # Open http://localhost:5174
 ```
 
+**Operations Monitor** (terminal 4):
+
+```bash
+npm run dev:monitor
+# Open http://localhost:5175
+```
+
 Vite dev servers proxy `/api/*` to `http://localhost:3000`.
 
 ### 5. (Optional) Seed sample data
@@ -317,7 +379,10 @@ Read from **`.env` in the project root** when starting the server from the root.
 | `POSTGRES_SCHEMA` | No | `public` | Postgres schema |
 | `GOOGLE_API_KEY` / `GEMINI_API_KEY` | No | — | Google Gemini |
 | `OPENAI_API_KEY` | No | — | OpenAI |
-| `LLM_PROVIDER` | No | auto | `google`, `openai`, or `ollama` |
+| `LLM_PROVIDER` | No | auto | `google`, `openai`, `deepseek`, or `ollama` |
+| `DEEPSEEK_API_KEY` | No | — | [DeepSeek API](https://platform.deepseek.com/api_keys) |
+| `DEEPSEEK_BASE_URL` | No | `https://api.deepseek.com` | DeepSeek API host (OpenAI-compatible) |
+| `DEEPSEEK_MODEL` | No | `deepseek-chat` | `deepseek-chat` or `deepseek-reasoner` |
 | `OLLAMA_API_KEY` | No* | — | Ollama Cloud ([settings/keys](https://ollama.com/settings/keys)) |
 | `OLLAMA_BASE_URL` | No | `https://ollama.com` if key set | Ollama API host |
 | `OLLAMA_MODEL` | No | `gpt-oss:120b,nemotron-3-super,gpt-oss:20b` | Comma-separated fallbacks (cloud) |
@@ -330,28 +395,31 @@ Read from **`.env` in the project root** when starting the server from the root.
 | `AGENT_STEP_RETRY_DELAY_MS` | No | `1500` | Delay between step retries |
 | `PROJECT_AI_DEBOUNCE_MS` | No | `15000` | Min gap between Project AI checks per project |
 | `PROJECT_AI_POLL_INTERVAL_MS` | No | `300000` | Periodic status poll (`0` = off) |
+| `OPS_MONITOR_STREAM_HOURS` | No | `3` | Ops Monitor agent stream window (1–24) |
 | `HELP_CHAT_EVENT_LIMIT` | No | `250` | Max events in help chat context |
 | `HELP_CHAT_ACTIVITY_LIMIT` | No | `40` | Max agent activity lines in help chat |
 | `VITE_API_URL` | No | `/api` | Frontend API base (build time) |
 | `VITE_WORKER_PORTAL_URL` | No | `http://localhost:5174` | Link in Leadership header |
-| `VITE_LEADERSHIP_URL` | No | `http://localhost:5173` | Link in Worker Portal |
+| `VITE_MONITOR_PORTAL_URL` | No | `http://localhost:5175` | Link in Leadership header |
+| `VITE_LEADERSHIP_URL` | No | `http://localhost:5173` | Link in Worker / Monitor portals |
 | `CONFIRM_CLEAN` | No | — | Set `1` for `clean-database.js` |
 
 Copy [`.env.example`](.env.example) for the full template.
 
-**LLM order (auto):** Google → OpenAI → Ollama → stubs.
+**LLM order (auto):** Google → DeepSeek → OpenAI → Ollama → stubs.
 
 ---
 
 ## Running the application
 
-### Development (three terminals)
+### Development (four terminals)
 
 | Terminal | Command | URL |
 |----------|---------|-----|
 | 1 | `npm start` (root) | API :3000 |
 | 2 | `npm run dev:client` | Leadership :5173 |
 | 3 | `npm run dev:worker` | Worker :5174 |
+| 4 | `npm run dev:monitor` | Ops Monitor :5175 |
 
 ### Production (separate hosts)
 
@@ -382,8 +450,10 @@ Enable CORS on the API for both frontend origins.
 ## Verify your setup
 
 ```bash
-curl -s http://localhost:3000/health | jq
+curl -s http://localhost:3000/api/health | jq
 ```
+
+Expect `status: "ok"`, `storeReady: true`, and `database: "up"` before load balancers send traffic.
 
 ```bash
 node server/scripts/postgres-diagnostic.js
@@ -489,14 +559,31 @@ Base URL: `http://localhost:3000` (also under `/api/…`).
 | `PATCH` | `/events/needs/:id` | Update need status |
 | `POST` | `/events/worker/status` | Legacy task status path |
 
-### Org insights, workforce & help
+### Org insights, workforce, revenue & help
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/org-insights` | Metrics + Org AI insights |
 | `GET` | `/workforce/analytics` | Productivity matrix & health indexes |
+| `GET` | `/revenue/analytics` | Budget/spend matrix and open budget requests |
+| `POST` | `/revenue/projects/:id/budget` | Set project budget |
+| `POST` | `/revenue/projects/:id/burn` | Record budget burn |
+| `POST` | `/revenue/projects/:id/budget-request` | Request additional budget |
 | `GET` | `/help-chat/meta` | Suggested questions + agents |
 | `POST` | `/help-chat` | Help chat (`message`, `agent`, `projectId`, `messages`) |
+
+### Operations monitor
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/ops/monitor` | Agent streams, boards, LLM queue status |
+
+### Preferences
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/preferences` | UI prefs (`?personId=`) |
+| `PATCH` | `/preferences` | Update theme, last project, etc. |
 
 ### Worker Portal (`/worker` and `/api/worker`)
 
@@ -546,6 +633,7 @@ AI-Native-Organization-System/
 │   ├── orgAI.txt
 │   └── helpChat.txt
 ├── server/
+│   ├── README.md
 │   ├── index.js
 │   ├── constants/
 │   │   ├── workerRequests.js
@@ -555,13 +643,19 @@ AI-Native-Organization-System/
 │   │   ├── worker.js
 │   │   ├── orgInsights.js
 │   │   ├── helpChat.js
-│   │   └── workforce.js
+│   │   ├── workforce.js
+│   │   ├── revenue.js
+│   │   ├── preferences.js
+│   │   └── opsMonitor.js
 │   ├── services/
 │   │   ├── orchestratorAI.js
 │   │   ├── teamBuilderAI.js
 │   │   ├── schedulerAI.js
-│   │   ├── projectAIEvaluator.js   # Status checks + polling
-│   │   ├── projectAIActions.js    # Delegate to other agents
+│   │   ├── projectAIEvaluator.js
+│   │   ├── projectAIActions.js
+│   │   ├── projectAIDeliverables.js
+│   │   ├── opsMonitor.js
+│   │   ├── financeService.js
 │   │   ├── assignmentGapFill.js
 │   │   ├── workforceAnalytics.js
 │   │   ├── helpChatContext.js
@@ -569,17 +663,28 @@ AI-Native-Organization-System/
 │   │   ├── workerRequestEffects.js
 │   │   ├── emergencyReturn.js
 │   │   └── metrics.js
-│   ├── lib/llm.js
+│   ├── lib/
+│   │   ├── llm.js
+│   │   ├── llmQueueDescribe.js
+│   │   ├── agentActivityLog.js
+│   │   └── eventPayload.js
 │   ├── models/
 │   └── store/postgresStore.js
 ├── client/                     # Leadership View
+│   ├── README.md
 │   ├── src/App.jsx
 │   ├── src/HelpChat.jsx
 │   ├── src/WorkforcePanel.jsx
+│   ├── src/RevenuePanel.jsx
 │   └── vite.config.js
-└── worker/                     # Worker Portal
+├── worker/                     # Worker Portal
+│   ├── README.md
+│   ├── src/App.jsx
+│   └── vite.config.js
+└── monitor/                    # Operations Monitor
     ├── README.md
     ├── src/App.jsx
+    ├── src/OpsMonitorPanel.jsx
     └── vite.config.js
 ```
 
@@ -594,6 +699,10 @@ AI-Native-Organization-System/
 | `node server/scripts/clean-database.js` | Wipe tables (`CONFIRM_CLEAN=1`) |
 | `node server/scripts/migrate-to-postgres.js` | Legacy JSON → Postgres |
 | `node server/scripts/test-rag-agents.js` | Agent context / retrieval test |
+| `node server/scripts/strip-assessment-event-bloat.js` | Remove oversized `_projectEventsForAssessment` from events |
+| `node server/scripts/backfill-agent-activity.js` | Populate `agent_activity` from historical AI events (monitor streams) |
+| `node server/scripts/repair-marketing-new-products-project.js` | Consolidate spam tasks / close duplicate needs on demo marketing project |
+| `node server/scripts/sync-postgres-store.js` | Rebuild project state, loads, task index, HR assignments from event log |
 
 ---
 
@@ -606,7 +715,11 @@ AI-Native-Organization-System/
 | [`docs/architecture.md`](docs/architecture.md) | Components and data flow |
 | [`docs/event-model.md`](docs/event-model.md) | Event types and state |
 | [`docs/orchestration-loop.md`](docs/orchestration-loop.md) | Orchestration + Project AI coordination |
+| [`docs/reliability.md`](docs/reliability.md) | Health, transactions, locks, graceful shutdown |
+| [`client/README.md`](client/README.md) | Leadership View setup and tabs |
+| [`server/README.md`](server/README.md) | API server routes and services |
 | [`worker/README.md`](worker/README.md) | Worker Portal setup and tabs |
+| [`monitor/README.md`](monitor/README.md) | Operations Monitor streams and boards |
 
 ---
 
@@ -634,11 +747,19 @@ Restart API once — reconciliation applies unassignment for past approvals.
 
 ### Project AI / help chat always stubbed
 
-Set `GOOGLE_API_KEY`, `OPENAI_API_KEY`, or Ollama Cloud (`LLM_PROVIDER=ollama`, `OLLAMA_API_KEY`). Check logs for `[LLM] Ollama Cloud`.
+Set `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, or Ollama Cloud (`LLM_PROVIDER=ollama`, `OLLAMA_API_KEY`). For DeepSeek: `LLM_PROVIDER=deepseek` and a key from [platform.deepseek.com](https://platform.deepseek.com/api_keys). Check logs for `[LLM] Using DeepSeek`.
 
 ### Blocker will not clear
 
 Set task to **In progress** or **Done** via Worker Portal or Leadership **Actions**.
+
+### Project stuck: budget gap / repeated approvals
+
+If all tasks are done but Project AI keeps creating budget needs, restart the API after pulling latest — deliverable gap logic treats **done budget tasks** and **approved budget requests** as satisfied. Run `node server/scripts/repair-marketing-new-products-project.js` for the demo marketing project if tasks were duplicated by replan loops.
+
+### Ops Monitor: LLM queue shows busy but empty segment details
+
+Restart API so `llm_logs` and live queue state merge into streams; pin the **rightmost** segment (“now”) for live lock info.
 
 ### `npm install` / `pg` not found
 
@@ -663,12 +784,13 @@ Run `npm install` at the **repository root**.
 **MVP+** includes:
 
 - Event-driven orchestration and Postgres persistence  
-- Leadership View (overview, projects, workforce, actions, logs, LLM logs, worker requests, help chat)  
+- Leadership View (overview, projects, workforce, **revenue**, actions, logs, LLM logs, worker requests, help chat)  
 - Worker Portal (overview, tasks, requests, HR inbox, project reviews, emergency return)  
-- Project AI status monitoring, periodic polls, and agent delegation  
-- Assignment gap fill, Org insights, workforce analytics, SSE, themes  
+- Operations Monitor (agent uptime streams, LLM queue, work boards, `agent_activity` in Postgres)  
+- Project AI status monitoring, deliverable-gap detection, periodic polls, agent delegation  
+- Assignment gap fill, Org insights, workforce analytics, revenue/budget API, SSE, themes  
 - Help chat with full org + workforce context  
-- Ollama Cloud support with improved JSON parsing  
+- Ollama Cloud / DeepSeek / Gemini / OpenAI with serialized LLM queue  
 
 **Not in MVP** — authentication, Slack/Jira/calendar integrations, email notifications.
 
